@@ -7,7 +7,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 
-use crate::config::{FeedKind, ServiceKind};
+use crate::config::{ServiceKind, SoundCloudFeedKind};
 use crate::media::{cache_key, is_fresh, media_path, stream_download, FeedItem};
 use crate::rss_feed;
 use crate::state::AppState;
@@ -26,6 +26,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/users/:user/soundcloud/:account/likes.xml",
             get(likes_feed),
+        )
+        .route(
+            "/users/:user/soundcloud/:account/popular-tracks.xml",
+            get(popular_tracks_feed),
         )
         .route(
             "/users/:user/soundcloud/:account/items/:item_id/audio.m4a",
@@ -47,7 +51,7 @@ async fn profile_feed(
     headers: HeaderMap,
     Path((user, account)): Path<(String, String)>,
 ) -> Response {
-    render_soundcloud_feed(state, headers, user, account, FeedKind::Profile).await
+    render_soundcloud_feed(state, headers, user, account, SoundCloudFeedKind::Profile).await
 }
 
 async fn likes_feed(
@@ -55,7 +59,22 @@ async fn likes_feed(
     headers: HeaderMap,
     Path((user, account)): Path<(String, String)>,
 ) -> Response {
-    render_soundcloud_feed(state, headers, user, account, FeedKind::Likes).await
+    render_soundcloud_feed(state, headers, user, account, SoundCloudFeedKind::Likes).await
+}
+
+async fn popular_tracks_feed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((user, account)): Path<(String, String)>,
+) -> Response {
+    render_soundcloud_feed(
+        state,
+        headers,
+        user,
+        account,
+        SoundCloudFeedKind::PopularTracks,
+    )
+    .await
 }
 
 async fn render_soundcloud_feed(
@@ -63,7 +82,7 @@ async fn render_soundcloud_feed(
     headers: HeaderMap,
     user: String,
     account: String,
-    feed: FeedKind,
+    feed: SoundCloudFeedKind,
 ) -> Response {
     let Some(service) = state
         .config
@@ -180,6 +199,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
+    use crate::html::feed_path;
     use crate::media::{DownloadChunk, DownloadCoordinator, MediaBackend};
 
     struct MockBackend;
@@ -189,7 +209,7 @@ mod tests {
         async fn fetch_feed(
             &self,
             _source_url: &str,
-            _feed: FeedKind,
+            _feed: SoundCloudFeedKind,
         ) -> anyhow::Result<Vec<FeedItem>> {
             Ok(vec![FeedItem {
                 id: "track-1".to_string(),
@@ -231,8 +251,16 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(html.contains("/users/derek/soundcloud/dereknet/feed.xml"));
-        assert!(html.contains("/users/derek/soundcloud/dereknet/likes.xml"));
+        assert!(html.contains(&configured_feed_path(
+            "dereknet",
+            SoundCloudFeedKind::Profile
+        )));
+        assert!(html.contains(&configured_feed_path("dereknet", SoundCloudFeedKind::Likes)));
+        assert!(html.contains(&configured_feed_path("NTS", SoundCloudFeedKind::Profile)));
+        assert!(html.contains(&configured_feed_path(
+            "NTS",
+            SoundCloudFeedKind::PopularTracks
+        )));
     }
 
     #[tokio::test]
@@ -257,7 +285,10 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/users/derek/soundcloud/dereknet/feed.xml")
+                    .uri(configured_feed_path(
+                        "dereknet",
+                        SoundCloudFeedKind::Profile,
+                    ))
                     .header(header::HOST, "example.test")
                     .body(Body::empty())
                     .unwrap(),
@@ -270,10 +301,28 @@ mod tests {
         let xml = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(xml.contains("Track One"));
-        assert!(xml.contains(
-            "http://example.test/users/derek/soundcloud/dereknet/items/track-1/audio.m4a"
-        ));
+        assert!(xml.contains(&configured_media_url("dereknet", "track-1")));
         assert!(xml.contains("audio/mp4"));
+    }
+
+    #[tokio::test]
+    async fn popular_tracks_feed_responds_for_configured_service() {
+        let app = test_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(configured_feed_path(
+                        "NTS",
+                        SoundCloudFeedKind::PopularTracks,
+                    ))
+                    .header(header::HOST, "example.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn test_router() -> Router {
@@ -282,5 +331,29 @@ mod tests {
         config.cache.data_dir = dir.path().to_path_buf();
         let coordinator = DownloadCoordinator::from_arc(Arc::new(MockBackend));
         router(AppState::new(config, Arc::new(coordinator)))
+    }
+
+    fn configured_feed_path(account: &str, feed: SoundCloudFeedKind) -> String {
+        let config = Config::default();
+        let user = &config.users[0];
+        let service = config
+            .service(&user.name, ServiceKind::Soundcloud, account)
+            .expect("configured test service");
+        feed_path(&user.name, service.kind.as_path(), &service.account, feed)
+    }
+
+    fn configured_media_url(account: &str, item_id: &str) -> String {
+        let config = Config::default();
+        let user = &config.users[0];
+        let service = config
+            .service(&user.name, ServiceKind::Soundcloud, account)
+            .expect("configured test service");
+        format!(
+            "http://example.test/users/{}/{}/{}/items/{}/audio.m4a",
+            urlencoding::encode(&user.name),
+            urlencoding::encode(service.kind.as_path()),
+            urlencoding::encode(&service.account),
+            urlencoding::encode(item_id)
+        )
     }
 }

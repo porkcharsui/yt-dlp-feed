@@ -1,4 +1,4 @@
-use crate::config::{Config, FeedKind};
+use crate::config::{Config, SoundCloudFeedKind};
 
 pub fn render_index(config: &Config) -> String {
     let mut feed_rows = String::new();
@@ -9,10 +9,9 @@ pub fn render_index(config: &Config) -> String {
                 let path = feed_path(&user.name, service.kind.as_path(), &service.account, *feed);
                 let source_url = feed.source_url(service);
                 let title = format!(
-                    "{} / {} / {} {}",
-                    user.name,
-                    service.kind.as_path(),
+                    "{} / {} / {}",
                     service.account,
+                    service.kind.as_path(),
                     feed.label()
                 );
                 feed_rows.push_str(&format!(
@@ -84,7 +83,7 @@ pub fn render_index(config: &Config) -> String {
     )
 }
 
-pub fn feed_path(user: &str, service: &str, account: &str, feed: FeedKind) -> String {
+pub fn feed_path(user: &str, service: &str, account: &str, feed: SoundCloudFeedKind) -> String {
     format!(
         "/users/{}/{}/{}/{}",
         urlencoding::encode(user),
@@ -114,13 +113,35 @@ mod tests {
     fn index_contains_profile_and_likes_links() {
         let html = render_index(&Config::default());
 
-        assert!(html.contains("/users/derek/soundcloud/dereknet/feed.xml"));
-        assert!(html.contains("/users/derek/soundcloud/dereknet/likes.xml"));
+        assert!(html.contains(&configured_feed_path(
+            "dereknet",
+            SoundCloudFeedKind::Profile
+        )));
+        assert!(html.contains(&configured_feed_path("dereknet", SoundCloudFeedKind::Likes)));
+        assert!(html.contains(&configured_feed_path("NTS", SoundCloudFeedKind::Profile)));
+        assert!(html.contains(&configured_feed_path(
+            "NTS",
+            SoundCloudFeedKind::PopularTracks
+        )));
         assert!(html.contains("https://soundcloud.com/dereknet"));
         assert!(html.contains("https://soundcloud.com/dereknet/likes"));
+        assert!(html.contains("https://soundcloud.com/user-202286394-991268468"));
+        assert!(html.contains("https://soundcloud.com/user-202286394-991268468/popular-tracks"));
         assert!(html.contains(
             r#"<a class="source-url" href="https://soundcloud.com/dereknet">https://soundcloud.com/dereknet</a>"#
         ));
+        assert!(html.contains("<strong>NTS / soundcloud / Profile</strong>"));
+        assert!(html.contains("<strong>NTS / soundcloud / Popular Tracks</strong>"));
+        assert!(!html.contains("derek / soundcloud / NTS Profile"));
         assert!(html.contains("RSS"));
+    }
+
+    fn configured_feed_path(account: &str, feed: SoundCloudFeedKind) -> String {
+        let config = Config::default();
+        let user = &config.users[0];
+        let service = config
+            .service(&user.name, crate::config::ServiceKind::Soundcloud, account)
+            .expect("configured test service");
+        feed_path(&user.name, service.kind.as_path(), &service.account, feed)
     }
 }

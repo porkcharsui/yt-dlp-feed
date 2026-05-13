@@ -1,14 +1,14 @@
 use chrono::{DateTime, Utc};
 use rss::{ChannelBuilder, EnclosureBuilder, GuidBuilder, ItemBuilder};
 
-use crate::config::{FeedKind, ServiceConfig};
+use crate::config::{ServiceConfig, SoundCloudFeedKind};
 use crate::media::FeedItem;
 
 pub fn render_feed(
     base_url: &str,
     user: &str,
     service: &ServiceConfig,
-    feed: FeedKind,
+    feed: SoundCloudFeedKind,
     items: &[FeedItem],
 ) -> anyhow::Result<String> {
     let feed_path = crate::html::feed_path(user, service.kind.as_path(), &service.account, feed);

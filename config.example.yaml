@@ -17,3 +17,9 @@ users:
         feeds:
           - profile
           - likes
+      - kind: "soundcloud"
+        account: "NTS"
+        profile_url: "https://soundcloud.com/user-202286394-991268468"
+        feeds:
+          - profile
+          - popular-tracks

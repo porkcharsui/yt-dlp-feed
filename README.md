@@ -2,7 +2,7 @@
 
 `yt-dlp-feed` is a Rust HTTP server that turns configured yt-dlp-supported accounts into podcast-style RSS feeds. Feed items point at stable server URLs that perform just-in-time downloads with `yt-dlp`, stream the audio back to the client, and keep the downloaded media only temporarily.
 
-The first target service is SoundCloud. The default config exposes the main profile and likes feeds for Derek's SoundCloud account, [`dereknet`](https://soundcloud.com/dereknet).
+The first target service is SoundCloud. The default config exposes the main profile and likes feeds for Derek's SoundCloud account, [`dereknet`](https://soundcloud.com/dereknet), plus the profile and popular tracks feeds for [`NTS`](https://soundcloud.com/user-202286394-991268468).
 
 ## Status
 
@@ -42,6 +42,12 @@ users:
         feeds:
           - profile
           - likes
+      - kind: "soundcloud"
+        account: "NTS"
+        profile_url: "https://soundcloud.com/user-202286394-991268468"
+        feeds:
+          - profile
+          - popular-tracks
 ```
 
 ## Routes
@@ -50,6 +56,7 @@ users:
 - `GET /healthz` returns `ok`.
 - `GET /users/{user}/soundcloud/{account}/feed.xml` serves the account profile feed.
 - `GET /users/{user}/soundcloud/{account}/likes.xml` serves the account likes feed.
+- `GET /users/{user}/soundcloud/{account}/popular-tracks.xml` serves the account popular tracks feed.
 - `GET /users/{user}/soundcloud/{account}/items/{item_id}/audio.m4a` downloads or serves cached AAC/M4A audio for a feed item.
 
 ## Download And Cache Behavior

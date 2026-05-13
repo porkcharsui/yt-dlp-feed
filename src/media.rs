@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufR
 use tokio::process::Command;
 use tokio::sync::{broadcast, watch, Mutex};
 
-use crate::config::{Config, DisconnectBehavior, FeedKind};
+use crate::config::{Config, DisconnectBehavior, SoundCloudFeedKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedItem {
@@ -32,7 +32,11 @@ pub struct FeedItem {
 
 #[async_trait]
 pub trait MediaBackend: Send + Sync + 'static {
-    async fn fetch_feed(&self, source_url: &str, feed: FeedKind) -> anyhow::Result<Vec<FeedItem>>;
+    async fn fetch_feed(
+        &self,
+        source_url: &str,
+        feed: SoundCloudFeedKind,
+    ) -> anyhow::Result<Vec<FeedItem>>;
     async fn download_audio(
         &self,
         source_url: &str,
@@ -121,7 +125,11 @@ fn find_in_paths(command_name: &str, paths: impl Iterator<Item = PathBuf>) -> Op
 
 #[async_trait]
 impl MediaBackend for YtDlpBackend {
-    async fn fetch_feed(&self, source_url: &str, feed: FeedKind) -> anyhow::Result<Vec<FeedItem>> {
+    async fn fetch_feed(
+        &self,
+        source_url: &str,
+        feed: SoundCloudFeedKind,
+    ) -> anyhow::Result<Vec<FeedItem>> {
         tracing::debug!(%source_url, ?feed, "yt-dlp playlist metadata fetch starting");
         let started = Instant::now();
         let playlist_result = self
@@ -792,7 +800,7 @@ impl DownloadCoordinator {
     pub async fn fetch_feed(
         &self,
         source_url: &str,
-        feed: FeedKind,
+        feed: SoundCloudFeedKind,
     ) -> anyhow::Result<Vec<FeedItem>> {
         tracing::debug!(%source_url, ?feed, "feed metadata request entering backend");
         self.backend.fetch_feed(source_url, feed).await
@@ -1116,7 +1124,7 @@ mod tests {
         async fn fetch_feed(
             &self,
             _source_url: &str,
-            _feed: FeedKind,
+            _feed: SoundCloudFeedKind,
         ) -> anyhow::Result<Vec<FeedItem>> {
             Ok(vec![])
         }

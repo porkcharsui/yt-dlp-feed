@@ -55,8 +55,8 @@ pub struct ServiceConfig {
     pub kind: ServiceKind,
     pub account: String,
     pub profile_url: String,
-    #[serde(default = "default_feeds")]
-    pub feeds: Vec<FeedKind>,
+    #[serde(default = "default_soundcloud_feeds")]
+    pub feeds: Vec<SoundCloudFeedKind>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -67,9 +67,11 @@ pub enum ServiceKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum FeedKind {
+pub enum SoundCloudFeedKind {
     Profile,
     Likes,
+    #[serde(alias = "popular-tracks")]
+    PopularTracks,
 }
 
 impl Default for Config {
@@ -80,12 +82,23 @@ impl Default for Config {
             auth: AuthConfig::default(),
             users: vec![UserConfig {
                 name: "derek".to_string(),
-                services: vec![ServiceConfig {
-                    kind: ServiceKind::Soundcloud,
-                    account: "dereknet".to_string(),
-                    profile_url: "https://soundcloud.com/dereknet".to_string(),
-                    feeds: default_feeds(),
-                }],
+                services: vec![
+                    ServiceConfig {
+                        kind: ServiceKind::Soundcloud,
+                        account: "dereknet".to_string(),
+                        profile_url: "https://soundcloud.com/dereknet".to_string(),
+                        feeds: default_soundcloud_feeds(),
+                    },
+                    ServiceConfig {
+                        kind: ServiceKind::Soundcloud,
+                        account: "NTS".to_string(),
+                        profile_url: "https://soundcloud.com/user-202286394-991268468".to_string(),
+                        feeds: vec![
+                            SoundCloudFeedKind::Profile,
+                            SoundCloudFeedKind::PopularTracks,
+                        ],
+                    },
+                ],
             }],
         }
     }
@@ -173,31 +186,36 @@ impl ServiceKind {
     }
 }
 
-impl FeedKind {
+impl SoundCloudFeedKind {
     pub fn as_path(self) -> &'static str {
         match self {
-            FeedKind::Profile => "feed.xml",
-            FeedKind::Likes => "likes.xml",
+            SoundCloudFeedKind::Profile => "feed.xml",
+            SoundCloudFeedKind::Likes => "likes.xml",
+            SoundCloudFeedKind::PopularTracks => "popular-tracks.xml",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            FeedKind::Profile => "Profile",
-            FeedKind::Likes => "Likes",
+            SoundCloudFeedKind::Profile => "Profile",
+            SoundCloudFeedKind::Likes => "Likes",
+            SoundCloudFeedKind::PopularTracks => "Popular Tracks",
         }
     }
 
     pub fn source_url(self, service: &ServiceConfig) -> String {
         match self {
-            FeedKind::Profile => service.profile_url.clone(),
-            FeedKind::Likes => format!("https://soundcloud.com/{}/likes", service.account),
+            SoundCloudFeedKind::Profile => service.profile_url.clone(),
+            SoundCloudFeedKind::Likes => {
+                format!("https://soundcloud.com/{}/likes", service.account)
+            }
+            SoundCloudFeedKind::PopularTracks => format!("{}/popular-tracks", service.profile_url),
         }
     }
 }
 
-fn default_feeds() -> Vec<FeedKind> {
-    vec![FeedKind::Profile, FeedKind::Likes]
+fn default_soundcloud_feeds() -> Vec<SoundCloudFeedKind> {
+    vec![SoundCloudFeedKind::Profile, SoundCloudFeedKind::Likes]
 }
 
 #[cfg(test)]
@@ -212,12 +230,34 @@ mod tests {
             .expect("default derek soundcloud service");
 
         assert_eq!(service.profile_url, "https://soundcloud.com/dereknet");
-        assert_eq!(service.feeds, vec![FeedKind::Profile, FeedKind::Likes]);
+        assert_eq!(
+            service.feeds,
+            vec![SoundCloudFeedKind::Profile, SoundCloudFeedKind::Likes]
+        );
         assert_eq!(
             config.cache.disconnect_behavior,
             DisconnectBehavior::DelayCancel
         );
         assert_eq!(config.cache.disconnect_grace_seconds, 15);
+
+        let nts = config
+            .service("derek", ServiceKind::Soundcloud, "NTS")
+            .expect("default NTS soundcloud service");
+        assert_eq!(
+            nts.profile_url,
+            "https://soundcloud.com/user-202286394-991268468"
+        );
+        assert_eq!(
+            nts.feeds,
+            vec![
+                SoundCloudFeedKind::Profile,
+                SoundCloudFeedKind::PopularTracks
+            ]
+        );
+        assert_eq!(
+            SoundCloudFeedKind::PopularTracks.source_url(nts),
+            "https://soundcloud.com/user-202286394-991268468/popular-tracks"
+        );
     }
 
     #[test]
@@ -243,6 +283,12 @@ users:
         feeds:
           - profile
           - likes
+      - kind: "soundcloud"
+        account: "NTS"
+        profile_url: "https://soundcloud.com/user-202286394-991268468"
+        feeds:
+          - profile
+          - popular-tracks
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
 
@@ -255,6 +301,16 @@ users:
         assert!(config
             .service("derek", ServiceKind::Soundcloud, "dereknet")
             .is_some());
+        assert_eq!(
+            config
+                .service("derek", ServiceKind::Soundcloud, "NTS")
+                .unwrap()
+                .feeds,
+            vec![
+                SoundCloudFeedKind::Profile,
+                SoundCloudFeedKind::PopularTracks
+            ]
+        );
     }
 
     #[test]
