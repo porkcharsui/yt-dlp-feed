@@ -1,0 +1,19 @@
+server:
+  bind: "127.0.0.1:8080"
+
+cache:
+  data_dir: "./data"
+  media_ttl_seconds: 86400
+
+auth:
+  enabled: false
+
+users:
+  - name: "derek"
+    services:
+      - kind: "soundcloud"
+        account: "dereknet"
+        profile_url: "https://soundcloud.com/dereknet"
+        feeds:
+          - profile
+          - likes

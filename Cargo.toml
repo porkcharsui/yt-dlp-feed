@@ -1,0 +1,36 @@
+[package]
+name = "yt-dlp-rss"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Serve RSS feeds with just-in-time yt-dlp-backed audio downloads."
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+http = "1"
+mime = "0.3"
+rss = "2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"
+yt-dlp = { git = "https://github.com/boul2gom/yt-dlp", default-features = false, features = ["cache-memory", "cache-redb", "rustls"] }
+
+[patch.crates-io]
+lofty = { git = "https://github.com/Serial-ATA/lofty-rs", tag = "0.23.3", package = "lofty" }
+
+[dev-dependencies]
+tempfile = "3"
