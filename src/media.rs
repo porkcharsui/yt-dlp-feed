@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use http::StatusCode;
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::process::Command;
 use tokio::sync::{watch, Mutex};
 
 use crate::config::{Config, FeedKind};
@@ -34,6 +36,8 @@ pub trait MediaBackend: Send + Sync + 'static {
 
 pub struct YtDlpBackend {
     downloader: yt_dlp::Downloader,
+    ytdlp_path: PathBuf,
+    ffmpeg_path: PathBuf,
 }
 
 impl YtDlpBackend {
@@ -42,8 +46,17 @@ impl YtDlpBackend {
         let output_dir = config.media_dir();
         fs::create_dir_all(&libs_dir).await?;
         fs::create_dir_all(&output_dir).await?;
+
+        let ytdlp_path = resolve_tool_path(libs_dir.join(executable_name("yt-dlp")), "yt-dlp")?;
+        let ffmpeg_path = resolve_tool_path(libs_dir.join(executable_name("ffmpeg")), "ffmpeg")?;
+        tracing::info!(
+            yt_dlp = %ytdlp_path.display(),
+            ffmpeg = %ffmpeg_path.display(),
+            "using media tools"
+        );
+
         let libraries =
-            yt_dlp::client::deps::Libraries::new(libs_dir.join("yt-dlp"), libs_dir.join("ffmpeg"));
+            yt_dlp::client::deps::Libraries::new(ytdlp_path.clone(), ffmpeg_path.clone());
         let cache_config = yt_dlp::cache::config::CacheConfig::builder()
             .cache_dir(config.metadata_dir())
             .persistent_backend(Some(yt_dlp::cache::PersistentBackendKind::Redb))
@@ -52,18 +65,82 @@ impl YtDlpBackend {
             .with_cache_config(cache_config)
             .build()
             .await?;
-        Ok(Self { downloader })
+        Ok(Self {
+            downloader,
+            ytdlp_path,
+            ffmpeg_path,
+        })
     }
+}
+
+fn executable_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn resolve_tool_path(preferred_path: PathBuf, command_name: &str) -> anyhow::Result<PathBuf> {
+    if preferred_path.is_file() {
+        return Ok(preferred_path);
+    }
+
+    find_in_path(command_name).with_context(|| {
+        format!(
+            "could not find {command_name}; expected {} or a {command_name} executable on PATH",
+            preferred_path.display()
+        )
+    })
+}
+
+fn find_in_path(command_name: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    find_in_paths(command_name, env::split_paths(&paths))
+}
+
+fn find_in_paths(command_name: &str, paths: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths
+        .map(|dir| dir.join(executable_name(command_name)))
+        .find(|candidate| candidate.is_file())
 }
 
 #[async_trait]
 impl MediaBackend for YtDlpBackend {
     async fn fetch_feed(&self, source_url: &str, feed: FeedKind) -> anyhow::Result<Vec<FeedItem>> {
-        let playlist = self
+        tracing::debug!(%source_url, ?feed, "yt-dlp playlist metadata fetch starting");
+        let started = Instant::now();
+        let playlist_result = self
             .downloader
             .fetch_playlist_infos(source_url.to_string())
-            .await
-            .with_context(|| format!("failed to fetch {feed:?} metadata for {source_url}"))?;
+            .await;
+
+        let playlist = match playlist_result {
+            Ok(playlist) => {
+                tracing::debug!(
+                    %source_url,
+                    ?feed,
+                    playlist_id = %playlist.id,
+                    playlist_title = %playlist.title,
+                    item_count = playlist.entries.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "yt-dlp playlist metadata fetch completed"
+                );
+                playlist
+            }
+            Err(err) => {
+                tracing::debug!(
+                    %source_url,
+                    ?feed,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "yt-dlp playlist metadata fetch failed"
+                );
+                return Err(err).with_context(|| {
+                    format!("failed to fetch {feed:?} metadata for {source_url}")
+                });
+            }
+        };
 
         Ok(playlist
             .entries
@@ -86,28 +163,98 @@ impl MediaBackend for YtDlpBackend {
             .parent()
             .context("download path has no parent")?;
         fs::create_dir_all(parent).await?;
-        let video = self
-            .downloader
-            .fetch_video_infos(source_url.to_string())
-            .await
-            .with_context(|| format!("failed to fetch media metadata for {source_url}"))?;
-        let file_name = output_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("download path has no valid file name")?;
+        remove_stale_file(output_path).await?;
+        let temp_path = temp_download_path(output_path)?;
+        remove_stale_file(&temp_path).await?;
 
-        self.downloader
-            .download_audio_stream_with_quality(
-                &video,
-                file_name,
-                yt_dlp::model::selector::AudioQuality::Best,
-                yt_dlp::model::selector::AudioCodecPreference::AAC,
-            )
+        tracing::debug!(
+            %source_url,
+            output_path = %output_path.display(),
+            temp_path = %temp_path.display(),
+            yt_dlp = %self.ytdlp_path.display(),
+            ffmpeg = %self.ffmpeg_path.display(),
+            "yt-dlp passthrough audio download starting"
+        );
+        let started = Instant::now();
+        let output = Command::new(&self.ytdlp_path)
+            .args(ytdlp_download_args(
+                &self.ffmpeg_path,
+                &temp_path,
+                source_url,
+            ))
+            .output()
             .await
-            .with_context(|| format!("failed to download AAC audio for {source_url}"))?;
+            .with_context(|| format!("failed to execute yt-dlp for {source_url}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(
+                %source_url,
+                output_path = %output_path.display(),
+                temp_path = %temp_path.display(),
+                elapsed_ms = started.elapsed().as_millis(),
+                status = ?output.status.code(),
+                stderr = %stderr,
+                "yt-dlp passthrough audio download failed"
+            );
+            return Err(anyhow::anyhow!(
+                "yt-dlp failed for {source_url}: {}",
+                stderr.trim()
+            ));
+        }
+
+        fs::rename(&temp_path, output_path).await.with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                temp_path.display(),
+                output_path.display()
+            )
+        })?;
+        let downloaded_bytes = fs::metadata(output_path)
+            .await
+            .ok()
+            .map(|metadata| metadata.len());
+        tracing::debug!(
+            %source_url,
+            output_path = %output_path.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            bytes = downloaded_bytes,
+            "yt-dlp passthrough audio download completed"
+        );
 
         Ok(())
     }
+}
+
+fn temp_download_path(output_path: &Path) -> anyhow::Result<PathBuf> {
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("download path has no valid file name")?;
+    Ok(output_path.with_file_name(format!("{file_name}.download.m4a")))
+}
+
+async fn remove_stale_file(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn ytdlp_download_args(ffmpeg_path: &Path, output_path: &Path, source_url: &str) -> Vec<String> {
+    vec![
+        "--no-playlist".to_string(),
+        "--no-part".to_string(),
+        "--no-progress".to_string(),
+        "--ffmpeg-location".to_string(),
+        ffmpeg_path.display().to_string(),
+        "-f".to_string(),
+        "bestaudio[ext=m4a]".to_string(),
+        "-o".to_string(),
+        output_path.display().to_string(),
+        source_url.to_string(),
+    ]
 }
 
 pub struct DownloadCoordinator {
@@ -138,6 +285,7 @@ impl DownloadCoordinator {
         source_url: &str,
         feed: FeedKind,
     ) -> anyhow::Result<Vec<FeedItem>> {
+        tracing::debug!(%source_url, ?feed, "feed metadata request entering backend");
         self.backend.fetch_feed(source_url, feed).await
     }
 
@@ -149,9 +297,21 @@ impl DownloadCoordinator {
     ) -> watch::Receiver<Option<Result<(), String>>> {
         let mut in_flight = self.in_flight.lock().await;
         if let Some(existing) = in_flight.get(&key) {
+            tracing::debug!(
+                %key,
+                %source_url,
+                output_path = %output_path.display(),
+                "joining existing media download"
+            );
             return existing.clone();
         }
 
+        tracing::debug!(
+            %key,
+            %source_url,
+            output_path = %output_path.display(),
+            "starting new media download"
+        );
         let (tx, rx) = watch::channel(None);
         in_flight.insert(key.clone(), rx.clone());
         let backend = Arc::clone(&self.backend);
@@ -162,6 +322,21 @@ impl DownloadCoordinator {
                 .download_audio(&source_url, &output_path)
                 .await
                 .map_err(|err| err.to_string());
+            match &result {
+                Ok(()) => tracing::debug!(
+                    %key,
+                    %source_url,
+                    output_path = %output_path.display(),
+                    "media download job completed"
+                ),
+                Err(err) => tracing::debug!(
+                    %key,
+                    %source_url,
+                    output_path = %output_path.display(),
+                    error = %err,
+                    "media download job failed"
+                ),
+            }
             let _ = tx.send(Some(result));
             map.lock().await.remove(&key);
         });
@@ -358,6 +533,52 @@ mod tests {
             .unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn resolve_tool_path_prefers_managed_binary() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(executable_name("yt-dlp"));
+        std::fs::write(&path, b"tool").unwrap();
+
+        assert_eq!(
+            resolve_tool_path(path.clone(), "missing-tool").unwrap(),
+            path
+        );
+    }
+
+    #[test]
+    fn find_in_paths_locates_system_binary_candidate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(executable_name("yt-dlp"));
+        std::fs::write(&path, b"tool").unwrap();
+
+        assert_eq!(
+            find_in_paths("yt-dlp", std::iter::once(dir.path().to_path_buf())),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn ytdlp_download_args_pin_m4a_output() {
+        let args = ytdlp_download_args(
+            Path::new("/usr/bin/ffmpeg"),
+            Path::new("/tmp/item.m4a"),
+            "https://soundcloud.com/example/item",
+        );
+
+        assert!(args.contains(&"bestaudio[ext=m4a]".to_string()));
+        assert!(args.contains(&"/tmp/item.m4a".to_string()));
+        assert!(args.contains(&"--no-part".to_string()));
+        assert!(args.contains(&"--ffmpeg-location".to_string()));
+    }
+
+    #[test]
+    fn temp_download_path_keeps_m4a_extension() {
+        assert_eq!(
+            temp_download_path(Path::new("/tmp/item.m4a")).unwrap(),
+            PathBuf::from("/tmp/item.m4a.download.m4a")
+        );
     }
 
     async fn wait_done(mut rx: watch::Receiver<Option<Result<(), String>>>) -> Result<(), String> {

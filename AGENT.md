@@ -1,6 +1,6 @@
 # Agent Guide
 
-This repository implements `yt-dlp-rss`, a Rust HTTP server that creates podcast-style RSS feeds backed by just-in-time yt-dlp audio downloads.
+This repository implements `yt-dlp-feed`, a Rust HTTP server that creates podcast-style RSS feeds backed by just-in-time yt-dlp audio downloads.
 
 ## Project Intent
 

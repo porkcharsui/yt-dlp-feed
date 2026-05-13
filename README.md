@@ -1,6 +1,6 @@
-# yt-dlp-rss
+# yt-dlp-feed
 
-`yt-dlp-rss` is a Rust HTTP server that turns configured yt-dlp-supported accounts into podcast-style RSS feeds. Feed items point at stable server URLs that perform just-in-time downloads with `yt-dlp`, stream the audio back to the client, and keep the downloaded media only temporarily.
+`yt-dlp-feed` is a Rust HTTP server that turns configured yt-dlp-supported accounts into podcast-style RSS feeds. Feed items point at stable server URLs that perform just-in-time downloads with `yt-dlp`, stream the audio back to the client, and keep the downloaded media only temporarily.
 
 The first target service is SoundCloud. The default config exposes the main profile and likes feeds for Derek's SoundCloud account, [`dereknet`](https://soundcloud.com/dereknet).
 
@@ -18,7 +18,7 @@ For the broader list of services that yt-dlp may support, see the canonical yt-d
 
 ## Configuration
 
-By default, the server looks for `config.yaml`. If no config exists, it uses the built-in Derek/SoundCloud defaults. You can also pass a path with `--config` or `YT_DLP_RSS_CONFIG`.
+By default, the server looks for `config.yaml`. If no config exists, it uses the built-in Derek/SoundCloud defaults. You can also pass a path with `--config` or `YT_DLP_FEED_CONFIG`.
 
 ```yaml
 server:
@@ -76,5 +76,14 @@ nix develop
 cargo test
 cargo run -- --config config.example.yaml
 ```
+
+To see request traces and yt-dlp wrapper activity in the console, run with debug logging:
+
+```sh
+cargo run -- --debug
+```
+
+You can also use `YT_DLP_FEED_DEBUG=true` for the same default debug filter, or set
+`RUST_LOG` directly for custom filtering.
 
 Normal tests should mock the yt-dlp boundary. Live SoundCloud tests should be opt-in so CI does not depend on network access or service availability.

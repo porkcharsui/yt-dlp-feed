@@ -1,5 +1,5 @@
 {
-  description = "yt-dlp-rss";
+  description = "yt-dlp-feed";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -11,7 +11,7 @@
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "yt-dlp-rss";
+          pname = "yt-dlp-feed";
           version = "0.1.0";
           src = ./.;
           cargoLock = {

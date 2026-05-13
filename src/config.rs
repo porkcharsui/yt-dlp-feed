@@ -209,7 +209,7 @@ mod tests {
 server:
   bind: "0.0.0.0:9090"
 cache:
-  data_dir: "/tmp/yt-dlp-rss"
+  data_dir: "/tmp/yt-dlp-feed"
   media_ttl_seconds: 42
 auth:
   enabled: true

@@ -40,7 +40,7 @@ pub fn render_index(config: &Config) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>yt-dlp-rss</title>
+  <title>yt-dlp-feed</title>
   <style>
     :root {{ color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     body {{ margin: 0; background: #f7f8fa; color: #17202a; }}
@@ -64,7 +64,7 @@ pub fn render_index(config: &Config) -> String {
 </head>
 <body>
   <main>
-    <h1>yt-dlp-rss</h1>
+    <h1>yt-dlp-feed</h1>
     <p>Podcast feeds generated from configured yt-dlp service accounts.</p>
     <section class="feeds" aria-label="Available feeds">
       {feed_rows}

@@ -4,33 +4,34 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Router;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use yt_dlp_rss::auth::AuthLayer;
-use yt_dlp_rss::config::Config;
-use yt_dlp_rss::media::{DownloadCoordinator, YtDlpBackend};
-use yt_dlp_rss::state::AppState;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use yt_dlp_feed::auth::AuthLayer;
+use yt_dlp_feed::config::Config;
+use yt_dlp_feed::media::{DownloadCoordinator, YtDlpBackend};
+use yt_dlp_feed::state::AppState;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
-    #[arg(short, long, env = "YT_DLP_RSS_CONFIG", default_value = "config.yaml")]
+    #[arg(short, long, env = "YT_DLP_FEED_CONFIG", default_value = "config.yaml")]
     config: PathBuf,
+
+    #[arg(long, env = "YT_DLP_FEED_DEBUG", action = ArgAction::SetTrue)]
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "yt_dlp_rss=info,tower_http=info".into()),
-        )
+        .with(log_filter(args.debug))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let args = Args::parse();
     let config = Config::load_or_default(&args.config)
         .await
         .with_context(|| format!("failed to load config from {}", args.config.display()))?;
@@ -42,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = config.server.bind.parse().context("invalid server.bind")?;
     let listener = TcpListener::bind(addr).await?;
 
-    tracing::info!(%addr, "yt-dlp-rss listening");
+    tracing::info!(%addr, "yt-dlp-feed listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -50,11 +51,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn log_filter(debug: bool) -> EnvFilter {
+    if debug {
+        "yt_dlp_feed=debug,yt_dlp=debug,tower_http=debug".into()
+    } else {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "yt_dlp_feed=info,tower_http=info".into())
+    }
+}
+
 fn build_router(state: AppState) -> Router {
     let auth = AuthLayer::new(state.config.auth.clone());
-    yt_dlp_rss::routes::router(state)
-        .layer(auth)
-        .layer(TraceLayer::new_for_http())
+    yt_dlp_feed::routes::router(state).layer(auth).layer(
+        TraceLayer::new_for_http()
+            .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
+            .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+            .on_response(DefaultOnResponse::new().level(Level::DEBUG)),
+    )
 }
 
 async fn shutdown_signal() {

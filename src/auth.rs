@@ -60,7 +60,7 @@ where
         Box::pin(async move {
             Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
-                .header(WWW_AUTHENTICATE, "Basic realm=\"yt-dlp-rss\"")
+                .header(WWW_AUTHENTICATE, "Basic realm=\"yt-dlp-feed\"")
                 .body(Body::from("authentication required"))
                 .expect("valid unauthorized response"))
         })
