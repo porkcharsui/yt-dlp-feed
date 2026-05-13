@@ -7,6 +7,7 @@ pub fn render_index(config: &Config) -> String {
         for service in &user.services {
             for feed in &service.feeds {
                 let path = feed_path(&user.name, service.kind.as_path(), &service.account, *feed);
+                let source_url = feed.source_url(service);
                 let title = format!(
                     "{} / {} / {} {}",
                     user.name,
@@ -15,16 +16,19 @@ pub fn render_index(config: &Config) -> String {
                     feed.label()
                 );
                 feed_rows.push_str(&format!(
-                    r#"<a class="feed" href="{path}">
+                    r#"<article class="feed">
   <span class="icon" aria-hidden="true">☊</span>
   <span>
-    <strong>{title}</strong>
-    <small>{path}</small>
+    <a class="source" href="{source_url}"><strong>{title}</strong></a>
+    <small><a class="source-url" href="{source_url}">{source_url_text}</a></small>
   </span>
-  <span class="rss" aria-label="RSS feed">RSS</span>
-</a>"#,
+  <a class="rss" href="{path}" aria-label="RSS feed for {title_attr}">RSS</a>
+</article>"#,
                     path = escape_attr(&path),
-                    title = escape_html(&title)
+                    source_url = escape_attr(&source_url),
+                    source_url_text = escape_html(&source_url),
+                    title = escape_html(&title),
+                    title_attr = escape_attr(&title)
                 ));
             }
         }
@@ -48,12 +52,17 @@ pub fn render_index(config: &Config) -> String {
     h1 {{ margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3rem); line-height: 1; }}
     p {{ margin: 0 0 28px; color: #53606d; }}
     .feeds {{ display: grid; gap: 10px; }}
-    .feed {{ display: grid; grid-template-columns: 44px 1fr auto; gap: 14px; align-items: center; padding: 14px; color: inherit; text-decoration: none; border: 1px solid #d9dee5; border-radius: 8px; background: #fff; }}
+    .feed {{ display: grid; grid-template-columns: 44px 1fr auto; gap: 14px; align-items: center; padding: 14px; color: inherit; border: 1px solid #d9dee5; border-radius: 8px; background: #fff; }}
     .feed:hover {{ border-color: #f47621; box-shadow: 0 8px 22px rgba(23, 32, 42, .08); }}
     .icon {{ display: grid; width: 40px; height: 40px; place-items: center; border-radius: 8px; background: #f47621; color: #fff; font-size: 24px; font-weight: 700; }}
+    a {{ color: inherit; }}
+    .source {{ text-decoration: none; }}
+    .source:hover {{ color: #d95f0e; }}
+    .source-url:hover {{ color: #d95f0e; }}
     strong {{ display: block; font-size: 1rem; }}
     small {{ display: block; margin-top: 4px; color: #65717d; overflow-wrap: anywhere; }}
-    .rss {{ padding: 6px 8px; border-radius: 6px; background: #eef2f6; color: #394552; font-weight: 700; font-size: .75rem; }}
+    .rss {{ padding: 6px 8px; border-radius: 6px; background: #eef2f6; color: #394552; font-weight: 700; font-size: .75rem; text-decoration: none; }}
+    .rss:hover {{ background: #f47621; color: #fff; }}
     @media (prefers-color-scheme: dark) {{
       body {{ background: #111418; color: #edf1f5; }}
       p, small {{ color: #a8b1ba; }}
@@ -107,6 +116,11 @@ mod tests {
 
         assert!(html.contains("/users/derek/soundcloud/dereknet/feed.xml"));
         assert!(html.contains("/users/derek/soundcloud/dereknet/likes.xml"));
+        assert!(html.contains("https://soundcloud.com/dereknet"));
+        assert!(html.contains("https://soundcloud.com/dereknet/likes"));
+        assert!(html.contains(
+            r#"<a class="source-url" href="https://soundcloud.com/dereknet">https://soundcloud.com/dereknet</a>"#
+        ));
         assert!(html.contains("RSS"));
     }
 }

@@ -24,6 +24,16 @@ pub struct ServerConfig {
 pub struct CacheConfig {
     pub data_dir: PathBuf,
     pub media_ttl_seconds: u64,
+    pub disconnect_behavior: DisconnectBehavior,
+    pub disconnect_grace_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectBehavior {
+    Continue,
+    Cancel,
+    DelayCancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +104,8 @@ impl Default for CacheConfig {
         Self {
             data_dir: PathBuf::from("./data"),
             media_ttl_seconds: 86_400,
+            disconnect_behavior: DisconnectBehavior::DelayCancel,
+            disconnect_grace_seconds: 15,
         }
     }
 }
@@ -201,16 +213,23 @@ mod tests {
 
         assert_eq!(service.profile_url, "https://soundcloud.com/dereknet");
         assert_eq!(service.feeds, vec![FeedKind::Profile, FeedKind::Likes]);
+        assert_eq!(
+            config.cache.disconnect_behavior,
+            DisconnectBehavior::DelayCancel
+        );
+        assert_eq!(config.cache.disconnect_grace_seconds, 15);
     }
 
     #[test]
-    fn parses_yaml_config_with_auth() {
+    fn parses_yaml_config_with_auth_and_disconnect_behavior() {
         let yaml = r#"
 server:
   bind: "0.0.0.0:9090"
 cache:
   data_dir: "/tmp/yt-dlp-feed"
   media_ttl_seconds: 42
+  disconnect_behavior: "cancel"
+  disconnect_grace_seconds: 5
 auth:
   enabled: true
   username: "derek"
@@ -229,10 +248,31 @@ users:
 
         assert_eq!(config.server.bind, "0.0.0.0:9090");
         assert_eq!(config.cache.media_ttl_seconds, 42);
+        assert_eq!(config.cache.disconnect_behavior, DisconnectBehavior::Cancel);
+        assert_eq!(config.cache.disconnect_grace_seconds, 5);
         assert!(config.auth.enabled);
         assert_eq!(config.auth.username.as_deref(), Some("derek"));
         assert!(config
             .service("derek", ServiceKind::Soundcloud, "dereknet")
             .is_some());
+    }
+
+    #[test]
+    fn parses_all_disconnect_behaviors() {
+        for (yaml_value, expected) in [
+            ("continue", DisconnectBehavior::Continue),
+            ("cancel", DisconnectBehavior::Cancel),
+            ("delay_cancel", DisconnectBehavior::DelayCancel),
+        ] {
+            let yaml = format!(
+                r#"
+cache:
+  disconnect_behavior: "{yaml_value}"
+"#
+            );
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+
+            assert_eq!(config.cache.disconnect_behavior, expected);
+        }
     }
 }

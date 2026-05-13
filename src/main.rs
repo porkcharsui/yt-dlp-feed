@@ -6,6 +6,7 @@ use anyhow::Context;
 use axum::Router;
 use clap::{ArgAction, Parser};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,15 +38,24 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to load config from {}", args.config.display()))?;
     config.ensure_directories().await?;
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let backend = YtDlpBackend::new(&config).await?;
-    let state = AppState::new(config.clone(), Arc::new(DownloadCoordinator::new(backend)));
+    let state = AppState::new(
+        config.clone(),
+        Arc::new(DownloadCoordinator::with_shutdown_and_disconnect(
+            backend,
+            shutdown_rx,
+            config.cache.disconnect_behavior,
+            std::time::Duration::from_secs(config.cache.disconnect_grace_seconds),
+        )),
+    );
     let app = build_router(state);
     let addr: SocketAddr = config.server.bind.parse().context("invalid server.bind")?;
     let listener = TcpListener::bind(addr).await?;
 
     tracing::info!(%addr, "yt-dlp-feed listening");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await?;
 
     Ok(())
@@ -70,7 +80,7 @@ fn build_router(state: AppState) -> Router {
     )
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -92,4 +102,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+
+    tracing::info!("shutdown signal received");
+    let _ = shutdown_tx.send(true);
 }

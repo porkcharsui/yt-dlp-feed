@@ -8,7 +8,7 @@ use axum::routing::get;
 use axum::Router;
 
 use crate::config::{FeedKind, ServiceKind};
-use crate::media::{cache_key, is_fresh, media_path, stream_growing_file, FeedItem};
+use crate::media::{cache_key, is_fresh, media_path, stream_download, FeedItem};
 use crate::rss_feed;
 use crate::state::AppState;
 
@@ -125,11 +125,11 @@ async fn download_audio(
         }
     }
 
-    let completion = state
+    let active = state
         .downloads
         .ensure_download(key, item.webpage_url, path.clone())
         .await;
-    let stream = stream_growing_file(path, completion);
+    let stream = stream_download(active);
     let body = Body::from_stream(stream);
 
     Response::builder()
@@ -180,7 +180,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
-    use crate::media::{DownloadCoordinator, MediaBackend};
+    use crate::media::{DownloadChunk, DownloadCoordinator, MediaBackend};
 
     struct MockBackend;
 
@@ -205,8 +205,16 @@ mod tests {
             &self,
             _source_url: &str,
             output_path: &FsPath,
+            chunks: tokio::sync::broadcast::Sender<DownloadChunk>,
+            _shutdown: tokio::sync::watch::Receiver<bool>,
         ) -> anyhow::Result<()> {
-            tokio::fs::write(output_path, b"audio").await?;
+            let temp_path = output_path.with_file_name("test.download.m4a");
+            tokio::fs::write(&temp_path, b"audio").await?;
+            let _ = chunks.send(DownloadChunk {
+                offset: 0,
+                bytes: bytes::Bytes::from_static(b"audio"),
+            });
+            tokio::fs::rename(temp_path, output_path).await?;
             Ok(())
         }
     }

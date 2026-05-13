@@ -27,6 +27,8 @@ server:
 cache:
   data_dir: "./data"
   media_ttl_seconds: 86400
+  disconnect_behavior: "delay_cancel"
+  disconnect_grace_seconds: 15
 
 auth:
   enabled: false
@@ -53,6 +55,12 @@ users:
 ## Download And Cache Behavior
 
 The server fetches feed metadata through the Rust [`yt-dlp`](https://github.com/boul2gom/yt-dlp) library. Audio downloads prefer the best available AAC stream and serve `audio/mp4` from `.m4a` URLs. If cached media exists and is still inside `media_ttl_seconds`, the server serves it directly. Otherwise, the first client request starts a new download, and concurrent requests for the same item share the same in-flight job.
+
+If every client disconnects while a download is still in flight, `cache.disconnect_behavior` controls whether the server keeps or cancels the orphaned download:
+
+- `continue` keeps downloading and caches the completed file.
+- `cancel` stops `yt-dlp` immediately and removes the partial `.download.m4a`.
+- `delay_cancel` waits `disconnect_grace_seconds` for a reconnect, then cancels if no client is attached.
 
 Completed media files live under `cache.data_dir` and are cleaned up after the configured TTL. This is intentional: clients are expected to cache media after the first successful fetch.
 
