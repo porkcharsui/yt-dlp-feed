@@ -1,0 +1,8 @@
+target/
+data/
+.git/
+.gitignore
+docker-compose*.yml
+compose*.yaml
+README.md
+AGENT.md

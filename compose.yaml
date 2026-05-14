@@ -1,0 +1,38 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: ${TAILSCALE_HOSTNAME:-yt-dlp-feed}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?Set TS_AUTHKEY to a reusable or ephemeral Tailscale auth key}
+      TS_AUTH_ONCE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./docker/tailscale:/config:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+      - net_raw
+    restart: unless-stopped
+
+  yt-dlp-feed:
+    build:
+      context: .
+    image: yt-dlp-feed:local
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    environment:
+      RUST_LOG: ${RUST_LOG:-yt_dlp_feed=info,tower_http=info}
+    volumes:
+      - yt-dlp-feed-data:/data
+      - ./docker/config.yaml:/config/config.yaml:ro
+    command: ["--config", "/config/config.yaml"]
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:
+  yt-dlp-feed-data:
