@@ -165,9 +165,17 @@ impl MediaBackend for YtDlpBackend {
             }
         };
 
-        Ok(playlist
+        let mut skipped_playlist_items = 0usize;
+        let items = playlist
             .entries
             .into_iter()
+            .filter(|entry| {
+                let is_playlist = is_soundcloud_playlist_item_url(&entry.url);
+                if is_playlist {
+                    skipped_playlist_items += 1;
+                }
+                !is_playlist
+            })
             .map(|entry| FeedItem {
                 id: entry.id,
                 title: entry.title,
@@ -179,7 +187,18 @@ impl MediaBackend for YtDlpBackend {
                 content_length: None,
                 thumbnail_url: entry.thumbnail,
             })
-            .collect())
+            .collect();
+
+        if skipped_playlist_items > 0 {
+            tracing::debug!(
+                %source_url,
+                ?feed,
+                skipped_playlist_items,
+                "skipped SoundCloud set/playlist entries"
+            );
+        }
+
+        Ok(items)
     }
 
     async fn download_audio(
@@ -352,6 +371,31 @@ async fn remove_stale_file(path: &Path) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn is_soundcloud_playlist_item_url(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return false;
+    };
+
+    let host = host
+        .split('@')
+        .next_back()
+        .and_then(|host| host.split(':').next())
+        .unwrap_or(host);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+
+    match host {
+        "soundcloud.com" | "www.soundcloud.com" => path.split('/').any(|part| part == "sets"),
+        "api-v2.soundcloud.com" => path
+            .split('/')
+            .next()
+            .is_some_and(|part| part == "playlists"),
+        _ => false,
     }
 }
 
@@ -1797,6 +1841,32 @@ mod tests {
         );
 
         assert!(args_contains_pair(&args, "--playlist-items", "1"));
+    }
+
+    #[test]
+    fn detects_soundcloud_playlist_item_urls() {
+        assert!(is_soundcloud_playlist_item_url(
+            "https://soundcloud.com/dereknet/sets/bumpin"
+        ));
+        assert!(is_soundcloud_playlist_item_url(
+            "https://api-v2.soundcloud.com/playlists/13564113"
+        ));
+        assert!(is_soundcloud_playlist_item_url(
+            "https://www.soundcloud.com/dereknet/sets/bumpin?utm_source=feed"
+        ));
+    }
+
+    #[test]
+    fn keeps_soundcloud_track_item_urls() {
+        assert!(!is_soundcloud_playlist_item_url(
+            "https://soundcloud.com/disclosuremusic/apollo"
+        ));
+        assert!(!is_soundcloud_playlist_item_url(
+            "https://api-v2.soundcloud.com/tracks/117448277"
+        ));
+        assert!(!is_soundcloud_playlist_item_url(
+            "https://example.test/dereknet/sets/bumpin"
+        ));
     }
 
     #[test]

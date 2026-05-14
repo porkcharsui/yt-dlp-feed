@@ -26,10 +26,17 @@ users:
         profile_url: "https://soundcloud.com/dereknet"
         feeds:
           - profile
-          - likes
+          - likes 
       - kind: "soundcloud"
         account: "NTS"
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
-          - likes
+
+  # - name: "NTS"
+  #   services:
+  #     - kind: "soundcloud"
+  #       account: "NTS Latest"
+  #       profile_url: "https://soundcloud.com/user-202286394-991268468"
+  #       feeds:
+  #         - profile
