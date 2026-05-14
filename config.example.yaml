@@ -8,6 +8,13 @@ cache:
   disconnect_behavior: "delay_cancel"
   disconnect_grace_seconds: 15
 
+metadata:
+  refresh_interval_hours: 24
+  refresh_recent_grace_minutes: 60
+
+downloads:
+  max_concurrent: 3
+
 auth:
   enabled: false
 
@@ -25,4 +32,4 @@ users:
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
-          - popular-tracks
+          - likes

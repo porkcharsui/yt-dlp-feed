@@ -10,6 +10,8 @@ use tokio::fs;
 pub struct Config {
     pub server: ServerConfig,
     pub cache: CacheConfig,
+    pub metadata: MetadataConfig,
+    pub downloads: DownloadsConfig,
     pub auth: AuthConfig,
     pub users: Vec<UserConfig>,
 }
@@ -47,6 +49,19 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MetadataConfig {
+    pub refresh_interval_hours: Option<u64>,
+    pub refresh_recent_grace_minutes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DownloadsConfig {
+    pub max_concurrent: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserConfig {
     pub name: String,
     pub services: Vec<ServiceConfig>,
@@ -72,8 +87,6 @@ pub enum ServiceKind {
 pub enum SoundCloudFeedKind {
     Profile,
     Likes,
-    #[serde(alias = "popular-tracks")]
-    PopularTracks,
 }
 
 impl Default for Config {
@@ -81,6 +94,8 @@ impl Default for Config {
         Self {
             server: ServerConfig::default(),
             cache: CacheConfig::default(),
+            metadata: MetadataConfig::default(),
+            downloads: DownloadsConfig::default(),
             auth: AuthConfig::default(),
             users: vec![UserConfig {
                 name: "derek".to_string(),
@@ -95,10 +110,7 @@ impl Default for Config {
                         kind: ServiceKind::Soundcloud,
                         account: "NTS".to_string(),
                         profile_url: "https://soundcloud.com/user-202286394-991268468".to_string(),
-                        feeds: vec![
-                            SoundCloudFeedKind::Profile,
-                            SoundCloudFeedKind::PopularTracks,
-                        ],
+                        feeds: default_soundcloud_feeds(),
                     },
                 ],
             }],
@@ -148,6 +160,32 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_hours: Some(24),
+            refresh_recent_grace_minutes: 60,
+        }
+    }
+}
+
+impl MetadataConfig {
+    pub fn refresh_interval(&self) -> Option<Duration> {
+        self.refresh_interval_hours
+            .map(|hours| Duration::from_secs(hours.saturating_mul(3600)))
+    }
+
+    pub fn refresh_recent_grace(&self) -> chrono::Duration {
+        chrono::Duration::minutes(self.refresh_recent_grace_minutes as i64)
+    }
+}
+
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        Self { max_concurrent: 3 }
+    }
+}
+
 impl Config {
     pub async fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         match fs::read_to_string(path).await {
@@ -159,6 +197,7 @@ impl Config {
 
     pub async fn ensure_directories(&self) -> anyhow::Result<()> {
         fs::create_dir_all(self.metadata_dir()).await?;
+        fs::create_dir_all(self.feed_metadata_dir()).await?;
         fs::create_dir_all(self.media_dir()).await?;
         fs::create_dir_all(self.libs_dir()).await?;
         Ok(())
@@ -166,6 +205,10 @@ impl Config {
 
     pub fn metadata_dir(&self) -> PathBuf {
         self.cache.data_dir.join("metadata")
+    }
+
+    pub fn feed_metadata_dir(&self) -> PathBuf {
+        self.cache.data_dir.join("feed-metadata")
     }
 
     pub fn media_dir(&self) -> PathBuf {
@@ -191,6 +234,127 @@ impl Config {
                     .find(|candidate| candidate.kind == service && candidate.account == account)
             })
     }
+
+    pub fn lint_and_repair(&mut self) {
+        if self.downloads.max_concurrent == 0 {
+            tracing::warn!(
+                "downloads.max_concurrent must be greater than 0; using default {}",
+                DownloadsConfig::default().max_concurrent
+            );
+            self.downloads.max_concurrent = DownloadsConfig::default().max_concurrent;
+        }
+
+        if self.metadata.refresh_interval_hours == Some(0) {
+            tracing::warn!("metadata.refresh_interval_hours=0 is invalid; using default 24");
+            self.metadata.refresh_interval_hours = MetadataConfig::default().refresh_interval_hours;
+        }
+
+        if self.auth.enabled
+            && (self.auth.username.as_deref().unwrap_or_default().is_empty()
+                || self.auth.password.as_deref().unwrap_or_default().is_empty())
+        {
+            tracing::warn!("auth.enabled=true but username or password is empty");
+        }
+
+        if !self.auth.enabled && self.server.bind.starts_with("0.0.0.0") {
+            tracing::warn!(
+                bind = %self.server.bind,
+                "auth is disabled while binding all interfaces; use only on a trusted network"
+            );
+        }
+
+        if self.downloads.max_concurrent > 10 {
+            tracing::warn!(
+                max_concurrent = self.downloads.max_concurrent,
+                "downloads.max_concurrent is high for yt-dlp-backed media downloads"
+            );
+        }
+
+        if matches!(self.cache.media_ttl_minutes, Some(minutes) if minutes < 10) {
+            tracing::warn!(
+                media_ttl_minutes = self.cache.media_ttl_minutes,
+                "media TTL is very small and may cause repeated downloads"
+            );
+        }
+
+        if self.metadata.refresh_interval_hours.is_none() {
+            tracing::warn!("metadata scheduled refresh is disabled");
+        }
+
+        let mut service_keys = std::collections::HashSet::new();
+        for user in &self.users {
+            if user.name.trim().is_empty() {
+                tracing::warn!("configured user has an empty name");
+            }
+            for service in &user.services {
+                if service.account.trim().is_empty() {
+                    tracing::warn!(user = %user.name, "configured service has an empty account");
+                }
+                if service.profile_url.trim().is_empty() {
+                    tracing::warn!(
+                        user = %user.name,
+                        account = %service.account,
+                        "configured service has an empty profile_url"
+                    );
+                } else if !service.profile_url.starts_with("http://")
+                    && !service.profile_url.starts_with("https://")
+                {
+                    tracing::warn!(
+                        user = %user.name,
+                        account = %service.account,
+                        profile_url = %service.profile_url,
+                        "configured profile_url does not start with http:// or https://"
+                    );
+                }
+
+                let key = (user.name.as_str(), service.kind, service.account.as_str());
+                if !service_keys.insert(key) {
+                    tracing::warn!(
+                        user = %user.name,
+                        service = %service.kind.as_path(),
+                        account = %service.account,
+                        "duplicate configured service route"
+                    );
+                }
+
+                let mut feed_kinds = std::collections::HashSet::new();
+                for feed in &service.feeds {
+                    if !feed_kinds.insert(*feed) {
+                        tracing::warn!(
+                            user = %user.name,
+                            service = %service.kind.as_path(),
+                            account = %service.account,
+                            feed = %feed.slug(),
+                            "duplicate feed kind configured"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn log_startup_summary(&self) {
+        let feed_count: usize = self
+            .users
+            .iter()
+            .flat_map(|user| &user.services)
+            .map(|service| service.feeds.len())
+            .sum();
+
+        tracing::info!(
+            bind = %self.server.bind,
+            data_dir = %self.cache.data_dir.display(),
+            feed_metadata_dir = %self.feed_metadata_dir().display(),
+            media_dir = %self.media_dir().display(),
+            auth_enabled = self.auth.enabled,
+            users = self.users.len(),
+            feeds = feed_count,
+            metadata_refresh_interval_hours = ?self.metadata.refresh_interval_hours,
+            metadata_recent_grace_minutes = self.metadata.refresh_recent_grace_minutes,
+            max_concurrent_downloads = self.downloads.max_concurrent,
+            "yt-dlp-feed startup summary"
+        );
+    }
 }
 
 impl ServiceKind {
@@ -206,7 +370,6 @@ impl SoundCloudFeedKind {
         match self {
             SoundCloudFeedKind::Profile => "feed.xml",
             SoundCloudFeedKind::Likes => "likes.xml",
-            SoundCloudFeedKind::PopularTracks => "popular-tracks.xml",
         }
     }
 
@@ -214,7 +377,13 @@ impl SoundCloudFeedKind {
         match self {
             SoundCloudFeedKind::Profile => "Profile",
             SoundCloudFeedKind::Likes => "Likes",
-            SoundCloudFeedKind::PopularTracks => "Popular Tracks",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            SoundCloudFeedKind::Profile => "profile",
+            SoundCloudFeedKind::Likes => "likes",
         }
     }
 
@@ -222,9 +391,8 @@ impl SoundCloudFeedKind {
         match self {
             SoundCloudFeedKind::Profile => service.profile_url.clone(),
             SoundCloudFeedKind::Likes => {
-                format!("https://soundcloud.com/{}/likes", service.account)
+                format!("{}/likes", service.profile_url.trim_end_matches('/'))
             }
-            SoundCloudFeedKind::PopularTracks => format!("{}/popular-tracks", service.profile_url),
         }
     }
 }
@@ -268,14 +436,11 @@ mod tests {
         );
         assert_eq!(
             nts.feeds,
-            vec![
-                SoundCloudFeedKind::Profile,
-                SoundCloudFeedKind::PopularTracks
-            ]
+            vec![SoundCloudFeedKind::Profile, SoundCloudFeedKind::Likes]
         );
         assert_eq!(
-            SoundCloudFeedKind::PopularTracks.source_url(nts),
-            "https://soundcloud.com/user-202286394-991268468/popular-tracks"
+            SoundCloudFeedKind::Likes.source_url(nts),
+            "https://soundcloud.com/user-202286394-991268468/likes"
         );
     }
 
@@ -308,7 +473,7 @@ users:
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
-          - popular-tracks
+          - likes
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
 
@@ -329,10 +494,7 @@ users:
                 .service("derek", ServiceKind::Soundcloud, "NTS")
                 .unwrap()
                 .feeds,
-            vec![
-                SoundCloudFeedKind::Profile,
-                SoundCloudFeedKind::PopularTracks
-            ]
+            vec![SoundCloudFeedKind::Profile, SoundCloudFeedKind::Likes]
         );
     }
 

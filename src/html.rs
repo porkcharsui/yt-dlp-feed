@@ -1,6 +1,7 @@
 use crate::config::{Config, SoundCloudFeedKind};
+use crate::metadata::{FeedStatus, IndexJson};
 
-pub fn render_index(config: &Config) -> String {
+pub fn render_index(config: &Config, index: &IndexJson) -> String {
     let mut feed_rows = String::new();
 
     for user in &config.users {
@@ -14,19 +15,43 @@ pub fn render_index(config: &Config) -> String {
                     service.account,
                     feed.label()
                 );
+                let status = index.feeds.iter().find(|candidate| {
+                    matches_feed(
+                        candidate,
+                        &user.name,
+                        service.kind.as_path(),
+                        &service.account,
+                        feed.slug(),
+                    )
+                });
+                let state = status
+                    .map(|status| status.metadata_cache.state.as_header_value())
+                    .unwrap_or("missing");
+                let last_fetched = status
+                    .and_then(|status| status.metadata_cache.last_successful_refresh)
+                    .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| "never".to_string());
+                let refresh_path = format!("{path}?refresh=1");
                 feed_rows.push_str(&format!(
                     r#"<article class="feed">
   <span class="icon" aria-hidden="true">☊</span>
   <span>
     <a class="source" href="{source_url}"><strong>{title}</strong></a>
     <small><a class="source-url" href="{source_url}">{source_url_text}</a></small>
+    <small>State: {state} · Last fetched (UTC): {last_fetched}</small>
   </span>
-  <a class="rss" href="{path}" aria-label="RSS feed for {title_attr}">RSS</a>
+  <span class="actions">
+    <a class="rss" href="{path}" aria-label="RSS feed for {title_attr}">RSS</a>
+    <a class="rss subtle" href="{refresh_path}" aria-label="Refresh RSS feed for {title_attr}">Refresh</a>
+  </span>
 </article>"#,
                     path = escape_attr(&path),
+                    refresh_path = escape_attr(&refresh_path),
                     source_url = escape_attr(&source_url),
                     source_url_text = escape_html(&source_url),
                     title = escape_html(&title),
+                    state = escape_html(state),
+                    last_fetched = escape_html(&last_fetched),
                     title_attr = escape_attr(&title)
                 ));
             }
@@ -60,7 +85,9 @@ pub fn render_index(config: &Config) -> String {
     .source-url:hover {{ color: #d95f0e; }}
     strong {{ display: block; font-size: 1rem; }}
     small {{ display: block; margin-top: 4px; color: #65717d; overflow-wrap: anywhere; }}
+    .actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: end; }}
     .rss {{ padding: 6px 8px; border-radius: 6px; background: #eef2f6; color: #394552; font-weight: 700; font-size: .75rem; text-decoration: none; }}
+    .rss.subtle {{ font-weight: 600; }}
     .rss:hover {{ background: #f47621; color: #fff; }}
     @media (prefers-color-scheme: dark) {{
       body {{ background: #111418; color: #edf1f5; }}
@@ -81,6 +108,13 @@ pub fn render_index(config: &Config) -> String {
 </body>
 </html>"#
     )
+}
+
+fn matches_feed(status: &FeedStatus, user: &str, service: &str, account: &str, feed: &str) -> bool {
+    status.user == user
+        && status.service == service
+        && status.account == account
+        && status.feed == feed
 }
 
 pub fn feed_path(user: &str, service: &str, account: &str, feed: SoundCloudFeedKind) -> String {
@@ -115,10 +149,23 @@ fn escape_attr(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::metadata::{IndexJson, IndexSummary};
 
     #[test]
     fn index_contains_profile_and_likes_links() {
-        let html = render_index(&Config::default());
+        let html = render_index(
+            &Config::default(),
+            &IndexJson {
+                generated_at: chrono::Utc::now(),
+                summary: IndexSummary {
+                    feeds_total: 0,
+                    feeds_ready: 0,
+                    feeds_missing: 0,
+                    refreshes_in_progress: 0,
+                },
+                feeds: vec![],
+            },
+        );
 
         assert!(html.contains(&configured_feed_path(
             "dereknet",
@@ -126,19 +173,16 @@ mod tests {
         )));
         assert!(html.contains(&configured_feed_path("dereknet", SoundCloudFeedKind::Likes)));
         assert!(html.contains(&configured_feed_path("NTS", SoundCloudFeedKind::Profile)));
-        assert!(html.contains(&configured_feed_path(
-            "NTS",
-            SoundCloudFeedKind::PopularTracks
-        )));
+        assert!(html.contains(&configured_feed_path("NTS", SoundCloudFeedKind::Likes)));
         assert!(html.contains("https://soundcloud.com/dereknet"));
         assert!(html.contains("https://soundcloud.com/dereknet/likes"));
         assert!(html.contains("https://soundcloud.com/user-202286394-991268468"));
-        assert!(html.contains("https://soundcloud.com/user-202286394-991268468/popular-tracks"));
+        assert!(html.contains("https://soundcloud.com/user-202286394-991268468/likes"));
         assert!(html.contains(
             r#"<a class="source-url" href="https://soundcloud.com/dereknet">https://soundcloud.com/dereknet</a>"#
         ));
         assert!(html.contains("<strong>SoundCloud: NTS / Profile</strong>"));
-        assert!(html.contains("<strong>SoundCloud: NTS / Popular Tracks</strong>"));
+        assert!(html.contains("<strong>SoundCloud: NTS / Likes</strong>"));
         assert!(!html.contains("derek / soundcloud / NTS Profile"));
         assert!(html.contains("RSS"));
     }

@@ -1,12 +1,19 @@
+use std::collections::HashMap;
+use std::time::SystemTime;
+
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use httpdate::{fmt_http_date, parse_http_date};
 
 use crate::config::{ServiceKind, SoundCloudFeedKind};
 use crate::media::{cache_key, is_fresh, media_path, stream_download, FeedItem};
+use crate::metadata::{identity_for, MetadataCacheState, RefreshOutcome, RefreshPriority};
 use crate::rss_feed;
 use crate::state::AppState;
 
@@ -16,7 +23,9 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(index))
+        .route("/index.json", get(index_json))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route(
             "/users/:user/soundcloud/:account/feed.xml",
             get(profile_feed),
@@ -26,10 +35,6 @@ pub fn router(state: AppState) -> Router {
             get(likes_feed),
         )
         .route(
-            "/users/:user/soundcloud/:account/popular-tracks.xml",
-            get(popular_tracks_feed),
-        )
-        .route(
             "/users/:user/soundcloud/:account/items/:item_id/audio.m4a",
             get(download_audio),
         )
@@ -37,40 +42,68 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn index(State(state): State<AppState>) -> Html<String> {
-    Html(crate::html::render_index(&state.config))
+    let index = state.metadata.index_json().await;
+    Html(crate::html::render_index(&state.config, &index))
+}
+
+async fn index_json(State(state): State<AppState>) -> Response {
+    match serde_json::to_string_pretty(&state.metadata.index_json().await) {
+        Ok(json) => (
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            json,
+        )
+            .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
+async fn readyz(State(state): State<AppState>) -> Response {
+    let missing = state.metadata.ready_missing_count().await;
+    if missing == 0 {
+        "ready".into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("metadata cache warming: {missing} feed(s) missing"),
+        )
+            .into_response()
+    }
+}
+
 async fn profile_feed(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((user, account)): Path<(String, String)>,
-) -> Response {
-    render_soundcloud_feed(state, headers, user, account, SoundCloudFeedKind::Profile).await
-}
-
-async fn likes_feed(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((user, account)): Path<(String, String)>,
-) -> Response {
-    render_soundcloud_feed(state, headers, user, account, SoundCloudFeedKind::Likes).await
-}
-
-async fn popular_tracks_feed(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Path((user, account)): Path<(String, String)>,
 ) -> Response {
     render_soundcloud_feed(
         state,
         headers,
+        query,
         user,
         account,
-        SoundCloudFeedKind::PopularTracks,
+        SoundCloudFeedKind::Profile,
+    )
+    .await
+}
+
+async fn likes_feed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path((user, account)): Path<(String, String)>,
+) -> Response {
+    render_soundcloud_feed(
+        state,
+        headers,
+        query,
+        user,
+        account,
+        SoundCloudFeedKind::Likes,
     )
     .await
 }
@@ -78,6 +111,7 @@ async fn popular_tracks_feed(
 async fn render_soundcloud_feed(
     state: AppState,
     headers: HeaderMap,
+    query: HashMap<String, String>,
     user: String,
     account: String,
     feed: SoundCloudFeedKind,
@@ -94,25 +128,101 @@ async fn render_soundcloud_feed(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let source_url = feed.source_url(&service);
-    let items = match state.downloads.fetch_feed(&source_url, feed).await {
-        Ok(items) => items,
-        Err(err) => return (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
+    let identity = identity_for(&user, &service, feed);
+    let refresh_requested = query
+        .get("refresh")
+        .is_some_and(|value| value == "1" || value == "true");
+    let mut refresh_header = None;
+
+    if refresh_requested {
+        let handle = state
+            .metadata
+            .enqueue_refresh(identity.clone(), &service, RefreshPriority::Manual)
+            .await;
+        let outcome = handle.wait().await;
+        refresh_header = Some(match outcome {
+            RefreshOutcome::Refreshed => MetadataCacheState::Ready,
+            RefreshOutcome::AlreadyRunning(state) => state,
+            RefreshOutcome::Failed(state) => state,
+        });
+    }
+
+    let Some(cached) = state.metadata.get(&identity).await else {
+        if !refresh_requested {
+            let _ = state
+                .metadata
+                .enqueue_refresh(identity.clone(), &service, RefreshPriority::Scheduled)
+                .await;
+        }
+        let state = refresh_header.unwrap_or_else(|| {
+            if refresh_requested {
+                MetadataCacheState::Error
+            } else {
+                MetadataCacheState::Warming
+            }
+        });
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "feed metadata cache is warming; no cached metadata is available yet",
+        )
+            .into_response();
+        if refresh_requested {
+            response.headers_mut().insert(
+                "x-yt-dlp-feed-refresh",
+                state
+                    .as_header_value()
+                    .parse()
+                    .expect("valid refresh header"),
+            );
+        }
+        return response;
     };
+
+    if !refresh_requested && not_modified(&headers, cached.last_successful_refresh) {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+
     let base_url = base_url_from_headers(&headers);
 
-    match rss_feed::render_feed(&base_url, &user, &service, feed, &items) {
-        Ok(xml) => (
-            [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
-            xml,
-        )
-            .into_response(),
+    match rss_feed::render_feed(
+        &base_url,
+        &user,
+        &service,
+        feed,
+        &cached.items,
+        cached.last_successful_refresh,
+    ) {
+        Ok(xml) => {
+            let mut response = (
+                [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
+                xml,
+            )
+                .into_response();
+            response.headers_mut().insert(
+                header::LAST_MODIFIED,
+                http_date(cached.last_successful_refresh)
+                    .parse()
+                    .expect("valid Last-Modified"),
+            );
+            if let Some(state) = refresh_header {
+                response.headers_mut().insert(
+                    "x-yt-dlp-feed-refresh",
+                    state
+                        .as_header_value()
+                        .parse()
+                        .expect("valid refresh header"),
+                );
+            }
+            response
+        }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
 
 async fn download_audio(
+    method: Method,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((user, account, item_id)): Path<(String, String, String)>,
 ) -> Response {
     let Some(service) = state
@@ -123,7 +233,7 @@ async fn download_audio(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let Some(item) = find_item(&state, &service, &item_id).await else {
+    let Some(item) = find_item(&state, &service, &user, &item_id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -132,20 +242,28 @@ async fn download_audio(
     let ttl = state.config.cache.media_ttl();
 
     if is_fresh(&path, ttl).await {
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                return ([(header::CONTENT_TYPE, "audio/mp4")], bytes).into_response();
-            }
-            Err(err) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-            }
-        }
+        return serve_cached_media(&method, &headers, &path).await;
     }
 
-    let active = state
+    if method == Method::HEAD {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let active = match state
         .downloads
-        .ensure_download(key, item.webpage_url, path.clone())
-        .await;
+        .try_ensure_download(key, item.webpage_url, path.clone())
+        .await
+    {
+        Ok(active) => active,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "30")],
+                "maximum concurrent media downloads reached",
+            )
+                .into_response()
+        }
+    };
     let stream = stream_download(active);
     let body = Body::from_stream(stream);
 
@@ -159,17 +277,145 @@ async fn download_audio(
 async fn find_item(
     state: &AppState,
     service: &crate::config::ServiceConfig,
+    user: &str,
     item_id: &str,
 ) -> Option<FeedItem> {
     for feed in &service.feeds {
-        let source_url = feed.source_url(service);
-        if let Ok(items) = state.downloads.fetch_feed(&source_url, *feed).await {
-            if let Some(item) = items.into_iter().find(|item| item.id == item_id) {
+        let identity = identity_for(user, service, *feed);
+        if let Some(cached) = state.metadata.get(&identity).await {
+            if let Some(item) = cached.items.into_iter().find(|item| item.id == item_id) {
                 return Some(item);
             }
         }
     }
     None
+}
+
+async fn serve_cached_media(
+    method: &Method,
+    headers: &HeaderMap,
+    path: &std::path::Path,
+) -> Response {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+
+    if method == Method::GET && cached_media_not_modified(headers, modified) {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_byte_range(value, len));
+
+    if headers.get(header::RANGE).is_some() && range.is_none() {
+        return range_not_satisfiable(len);
+    }
+
+    let (status, start, end) = if let Some((start, end)) = range {
+        (StatusCode::PARTIAL_CONTENT, start, end)
+    } else {
+        (StatusCode::OK, 0, len.saturating_sub(1))
+    };
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "audio/mp4")
+        .header(header::ACCEPT_RANGES, "bytes");
+    if let Some(modified) = modified {
+        builder = builder.header(header::LAST_MODIFIED, fmt_http_date(modified));
+    }
+
+    if len == 0 {
+        builder = builder.header(header::CONTENT_LENGTH, "0");
+        return builder
+            .body(Body::empty())
+            .expect("valid empty media response");
+    }
+
+    let content_len = end - start + 1;
+    builder = builder.header(header::CONTENT_LENGTH, content_len.to_string());
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+    }
+
+    if method == Method::HEAD {
+        return builder.body(Body::empty()).expect("valid HEAD response");
+    }
+
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let slice = bytes
+                .get(start as usize..=end as usize)
+                .map(Bytes::copy_from_slice)
+                .unwrap_or_default();
+            builder
+                .body(Body::from(slice))
+                .expect("valid media response")
+        }
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+fn range_not_satisfiable(len: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+        .body(Body::empty())
+        .expect("valid range response")
+}
+
+fn parse_byte_range(value: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = value.strip_prefix("bytes=")?;
+    if spec.contains(',') || len == 0 {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = len.saturating_sub(suffix);
+        return Some((start, len - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() {
+        len - 1
+    } else {
+        end.parse::<u64>().ok()?
+    };
+    if start >= len || end < start {
+        return None;
+    }
+    Some((start, end.min(len - 1)))
+}
+
+fn not_modified(headers: &HeaderMap, last_successful_refresh: DateTime<Utc>) -> bool {
+    headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_http_date(value).ok())
+        .is_some_and(|since| DateTime::<Utc>::from(since) >= last_successful_refresh)
+}
+
+fn cached_media_not_modified(headers: &HeaderMap, modified: Option<SystemTime>) -> bool {
+    let Some(modified) = modified else {
+        return false;
+    };
+    headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_http_date(value).ok())
+        .is_some_and(|since| since >= modified)
+}
+
+fn http_date(timestamp: DateTime<Utc>) -> String {
+    fmt_http_date(timestamp.into())
 }
 
 fn base_url_from_headers(headers: &HeaderMap) -> String {
@@ -199,6 +445,7 @@ mod tests {
     use crate::config::Config;
     use crate::html::feed_path;
     use crate::media::{DownloadChunk, DownloadCoordinator, MediaBackend};
+    use crate::metadata::{identity_for, MetadataCache};
 
     struct MockBackend;
 
@@ -209,14 +456,26 @@ mod tests {
             _source_url: &str,
             _feed: SoundCloudFeedKind,
         ) -> anyhow::Result<Vec<FeedItem>> {
-            Ok(vec![FeedItem {
-                id: "track-1".to_string(),
-                title: "Track One".to_string(),
-                webpage_url: "https://soundcloud.com/dereknet/track-one".to_string(),
-                description: Some("A track".to_string()),
-                published_at: None,
-                content_length: Some(12),
-            }])
+            Ok(vec![
+                FeedItem {
+                    id: "track-2".to_string(),
+                    title: "Track Two".to_string(),
+                    webpage_url: "https://soundcloud.com/dereknet/track-two".to_string(),
+                    description: Some("Second in source order".to_string()),
+                    published_at: None,
+                    content_length: Some(12),
+                    thumbnail_url: Some("https://example.test/art-2.jpg".to_string()),
+                },
+                FeedItem {
+                    id: "track-1".to_string(),
+                    title: "Track One".to_string(),
+                    webpage_url: "https://soundcloud.com/dereknet/track-one".to_string(),
+                    description: Some("First in title, second in source order".to_string()),
+                    published_at: None,
+                    content_length: Some(12),
+                    thumbnail_url: Some("https://example.test/art-1.jpg".to_string()),
+                },
+            ])
         }
 
         async fn download_audio(
@@ -239,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn index_lists_configured_feed_links() {
-        let app = test_router();
+        let app = test_router().await;
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -255,15 +514,12 @@ mod tests {
         )));
         assert!(html.contains(&configured_feed_path("dereknet", SoundCloudFeedKind::Likes)));
         assert!(html.contains(&configured_feed_path("NTS", SoundCloudFeedKind::Profile)));
-        assert!(html.contains(&configured_feed_path(
-            "NTS",
-            SoundCloudFeedKind::PopularTracks
-        )));
+        assert!(html.contains(&configured_feed_path("NTS", SoundCloudFeedKind::Likes)));
     }
 
     #[tokio::test]
     async fn healthz_responds_ok() {
-        let app = test_router();
+        let app = test_router().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -279,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn rss_contains_stable_audio_enclosure() {
-        let app = test_router();
+        let app = test_router().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -301,19 +557,43 @@ mod tests {
         assert!(xml.contains("Track One"));
         assert!(xml.contains(&configured_media_url("dereknet", "track-1")));
         assert!(xml.contains("audio/mp4"));
+        assert!(xml.contains("media:thumbnail"));
+        assert!(xml.contains("itunes:image"));
+        assert!(xml.find("Track Two").unwrap() < xml.find("Track One").unwrap());
     }
 
     #[tokio::test]
-    async fn popular_tracks_feed_responds_for_configured_service() {
-        let app = test_router();
+    async fn index_json_contains_metadata_status_summary() {
+        let app = test_router().await;
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(configured_feed_path(
-                        "NTS",
-                        SoundCloudFeedKind::PopularTracks,
-                    ))
-                    .header(header::HOST, "example.test")
+                    .uri("/index.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["summary"]["feeds_missing"], 0);
+        assert_eq!(json["feeds"][0]["metadata_cache"]["state"], "ready");
+        assert!(json["feeds"][0].get("rss_path").is_none());
+        assert!(json["feeds"][0].get("rss_url").is_none());
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_ready_when_all_feeds_have_metadata() {
+        let app = test_router().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -323,12 +603,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    fn test_router() -> Router {
+    #[tokio::test]
+    async fn cached_media_supports_byte_ranges() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("item.m4a");
+        tokio::fs::write(&path, b"abcdef").await.unwrap();
+        let headers = HeaderMap::from_iter([(
+            header::RANGE,
+            "bytes=2-4".parse().expect("valid range header"),
+        )]);
+
+        let response = serve_cached_media(&Method::GET, &headers, &path).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-4/6"
+        );
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"cde");
+    }
+
+    #[tokio::test]
+    async fn cached_media_head_includes_lengths_without_body() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("item.m4a");
+        tokio::fs::write(&path, b"abcdef").await.unwrap();
+
+        let response = serve_cached_media(&Method::HEAD, &HeaderMap::new(), &path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "6");
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    async fn test_router() -> Router {
         let dir = tempdir().unwrap();
         let mut config = Config::default();
-        config.cache.data_dir = dir.path().to_path_buf();
-        let coordinator = DownloadCoordinator::from_arc(Arc::new(MockBackend));
-        router(AppState::new(config, Arc::new(coordinator)))
+        config.cache.data_dir = dir.keep();
+        let coordinator = Arc::new(DownloadCoordinator::from_arc(Arc::new(MockBackend)));
+        let metadata = Arc::new(MetadataCache::new(config.clone()).await.unwrap());
+        for user in &config.users {
+            for service in &user.services {
+                for feed in &service.feeds {
+                    let items = coordinator
+                        .fetch_feed(&feed.source_url(service), *feed)
+                        .await
+                        .unwrap();
+                    metadata
+                        .store_success_for_test(
+                            identity_for(&user.name, service, *feed),
+                            service,
+                            items,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        router(AppState::new(config, coordinator, metadata))
     }
 
     fn configured_feed_path(account: &str, feed: SoundCloudFeedKind) -> String {

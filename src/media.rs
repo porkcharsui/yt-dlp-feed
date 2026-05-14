@@ -16,11 +16,11 @@ use sha2::{Digest, Sha256};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 
 use crate::config::{Config, DisconnectBehavior, SoundCloudFeedKind};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FeedItem {
     pub id: String,
     pub title: String,
@@ -28,6 +28,7 @@ pub struct FeedItem {
     pub description: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub content_length: Option<u64>,
+    pub thumbnail_url: Option<String>,
 }
 
 #[async_trait]
@@ -176,6 +177,7 @@ impl MediaBackend for YtDlpBackend {
                     .map(|uploader| format!("Uploaded by {uploader}")),
                 published_at: None,
                 content_length: None,
+                thumbnail_url: entry.thumbnail,
             })
             .collect())
     }
@@ -548,10 +550,14 @@ async fn log_ytdlp_stderr(
 pub struct DownloadCoordinator {
     backend: Arc<dyn MediaBackend>,
     in_flight: Arc<Mutex<HashMap<String, ActiveDownload>>>,
+    download_slots: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     disconnect_behavior: DisconnectBehavior,
     disconnect_grace: Duration,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadLimitError;
 
 #[derive(Clone)]
 pub struct ActiveDownload {
@@ -711,6 +717,7 @@ impl DownloadCoordinator {
         Self {
             backend: Arc::new(backend),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            download_slots: Arc::new(Semaphore::new(3)),
             shutdown: default_shutdown_receiver(),
             disconnect_behavior: DisconnectBehavior::DelayCancel,
             disconnect_grace: Duration::from_secs(15),
@@ -741,6 +748,7 @@ impl DownloadCoordinator {
         Self {
             backend: Arc::new(backend),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            download_slots: Arc::new(Semaphore::new(3)),
             shutdown,
             disconnect_behavior,
             disconnect_grace,
@@ -751,6 +759,7 @@ impl DownloadCoordinator {
         Self {
             backend,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            download_slots: Arc::new(Semaphore::new(3)),
             shutdown: default_shutdown_receiver(),
             disconnect_behavior: DisconnectBehavior::DelayCancel,
             disconnect_grace: Duration::from_secs(15),
@@ -788,9 +797,36 @@ impl DownloadCoordinator {
         disconnect_behavior: DisconnectBehavior,
         disconnect_grace: Duration,
     ) -> Self {
+        Self::from_arc_with_shutdown_disconnect_and_limit(
+            backend,
+            shutdown,
+            disconnect_behavior,
+            disconnect_grace,
+            3,
+        )
+    }
+
+    pub fn from_arc_with_limit(backend: Arc<dyn MediaBackend>, max_concurrent: usize) -> Self {
+        Self::from_arc_with_shutdown_disconnect_and_limit(
+            backend,
+            default_shutdown_receiver(),
+            DisconnectBehavior::DelayCancel,
+            Duration::from_secs(15),
+            max_concurrent,
+        )
+    }
+
+    pub fn from_arc_with_shutdown_disconnect_and_limit(
+        backend: Arc<dyn MediaBackend>,
+        shutdown: watch::Receiver<bool>,
+        disconnect_behavior: DisconnectBehavior,
+        disconnect_grace: Duration,
+        max_concurrent: usize,
+    ) -> Self {
         Self {
             backend,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            download_slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
             shutdown,
             disconnect_behavior,
             disconnect_grace,
@@ -812,6 +848,17 @@ impl DownloadCoordinator {
         source_url: String,
         output_path: PathBuf,
     ) -> ActiveDownload {
+        self.try_ensure_download(key, source_url, output_path)
+            .await
+            .unwrap_or_else(|_| active_download_error("maximum concurrent media downloads reached"))
+    }
+
+    pub async fn try_ensure_download(
+        &self,
+        key: String,
+        source_url: String,
+        output_path: PathBuf,
+    ) -> Result<ActiveDownload, DownloadLimitError> {
         let mut in_flight = self.in_flight.lock().await;
         if let Some(existing) = in_flight.get(&key) {
             tracing::debug!(
@@ -820,8 +867,14 @@ impl DownloadCoordinator {
                 output_path = %output_path.display(),
                 "joining existing media download"
             );
-            return existing.clone();
+            return Ok(existing.clone());
         }
+
+        let permit = self
+            .download_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DownloadLimitError)?;
 
         let temp_path = match temp_download_path(&output_path) {
             Ok(path) => path,
@@ -830,7 +883,7 @@ impl DownloadCoordinator {
                 drop(completion_tx);
                 let (chunks, _) = broadcast::channel(1);
                 let (cancel_tx, cancel_rx) = watch::channel(false);
-                return ActiveDownload {
+                return Ok(ActiveDownload {
                     temp_path: output_path,
                     completion,
                     chunks,
@@ -846,7 +899,7 @@ impl DownloadCoordinator {
                         grace: self.disconnect_grace,
                         cancel_tx,
                     }),
-                };
+                });
             }
         };
         tracing::debug!(
@@ -890,6 +943,7 @@ impl DownloadCoordinator {
         });
 
         tokio::spawn(async move {
+            let _permit = permit;
             let result = backend
                 .download_audio(&source_url, &output_path, chunks, cancel_rx)
                 .await
@@ -914,7 +968,31 @@ impl DownloadCoordinator {
             map.lock().await.remove(&key);
         });
 
-        active
+        Ok(active)
+    }
+}
+
+fn active_download_error(message: &str) -> ActiveDownload {
+    let (completion_tx, completion) = watch::channel(Some(Err(message.to_string())));
+    drop(completion_tx);
+    let (chunks, _) = broadcast::channel(1);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    ActiveDownload {
+        temp_path: PathBuf::new(),
+        completion,
+        chunks,
+        shutdown: cancel_rx,
+        lifecycle: Arc::new(DownloadLifecycle {
+            key: "download-limit".to_string(),
+            source_url: String::new(),
+            temp_path: PathBuf::new(),
+            clients: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
+            completed: AtomicBool::new(true),
+            behavior: DisconnectBehavior::Cancel,
+            grace: Duration::from_secs(0),
+            cancel_tx,
+        }),
     }
 }
 
@@ -1264,6 +1342,47 @@ mod tests {
         let active2 = coordinator
             .ensure_download("same".to_string(), "url".to_string(), path)
             .await;
+
+        release.notify_one();
+        wait_done(active1.completion()).await.unwrap();
+        wait_done(active2.completion()).await.unwrap();
+        assert_eq!(backend.downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn new_downloads_respect_concurrency_limit() {
+        let dir = tempdir().unwrap();
+        let path1 = dir.path().join("item-1.m4a");
+        let path2 = dir.path().join("item-2.m4a");
+        let (backend, _release) = MockBackend::shared(true, false);
+        let coordinator = DownloadCoordinator::from_arc_with_limit(backend, 1);
+
+        let _active = coordinator
+            .try_ensure_download("one".to_string(), "url-1".to_string(), path1)
+            .await
+            .unwrap();
+        let limited = coordinator
+            .try_ensure_download("two".to_string(), "url-2".to_string(), path2)
+            .await;
+
+        assert!(limited.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_allows_joining_existing_download() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("item.m4a");
+        let (backend, release) = MockBackend::shared(true, false);
+        let coordinator = DownloadCoordinator::from_arc_with_limit(backend.clone(), 1);
+
+        let active1 = coordinator
+            .try_ensure_download("same".to_string(), "url".to_string(), path.clone())
+            .await
+            .unwrap();
+        let active2 = coordinator
+            .try_ensure_download("same".to_string(), "url".to_string(), path)
+            .await
+            .unwrap();
 
         release.notify_one();
         wait_done(active1.completion()).await.unwrap();

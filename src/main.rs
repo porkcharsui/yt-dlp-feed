@@ -13,6 +13,7 @@ use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::Subscrib
 use yt_dlp_feed::auth::AuthLayer;
 use yt_dlp_feed::config::Config;
 use yt_dlp_feed::media::{DownloadCoordinator, YtDlpBackend};
+use yt_dlp_feed::metadata::MetadataCache;
 use yt_dlp_feed::state::AppState;
 
 #[derive(Debug, Parser)]
@@ -33,22 +34,33 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = Config::load_or_default(&args.config)
+    let mut config = Config::load_or_default(&args.config)
         .await
         .with_context(|| format!("failed to load config from {}", args.config.display()))?;
+    config.lint_and_repair();
+    config.log_startup_summary();
     config.ensure_directories().await?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let backend = YtDlpBackend::new(&config).await?;
-    let state = AppState::new(
-        config.clone(),
-        Arc::new(DownloadCoordinator::with_shutdown_and_disconnect(
-            backend,
+    let metadata = Arc::new(MetadataCache::new(config.clone()).await?);
+    let downloads = Arc::new(
+        DownloadCoordinator::from_arc_with_shutdown_disconnect_and_limit(
+            Arc::new(backend),
             shutdown_rx,
             config.cache.disconnect_behavior,
             std::time::Duration::from_secs(config.cache.disconnect_grace_seconds),
-        )),
+            config.downloads.max_concurrent,
+        ),
     );
+    let state = AppState::new(
+        config.clone(),
+        Arc::clone(&downloads),
+        Arc::clone(&metadata),
+    );
+    metadata.start_worker(Arc::clone(&downloads));
+    metadata.start_startup_warming();
+    metadata.start_scheduled_refresh();
     let app = build_router(state);
     let addr: SocketAddr = config.server.bind.parse().context("invalid server.bind")?;
     let listener = TcpListener::bind(addr).await?;
