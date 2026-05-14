@@ -939,9 +939,15 @@ pub fn media_path(config: &Config, key: &str) -> PathBuf {
     config.media_dir().join(format!("{key}.m4a"))
 }
 
-pub async fn is_fresh(path: &Path, ttl: Duration) -> bool {
+pub async fn is_fresh(path: &Path, ttl: Option<Duration>) -> bool {
     let Ok(metadata) = fs::metadata(path).await else {
         return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Some(ttl) = ttl else {
+        return true;
     };
     let Ok(modified) = metadata.modified() else {
         return false;
@@ -1058,34 +1064,86 @@ fn trim_chunk_to_offset(chunk: DownloadChunk, offset: &mut u64) -> Option<Bytes>
 }
 
 pub async fn cleanup_expired_media(config: Config) {
-    let ttl = Duration::from_secs(config.cache.media_ttl_seconds);
     loop {
-        if let Err(err) = cleanup_once(&config.media_dir(), ttl).await {
+        if let Err(err) = cleanup_once(
+            &config.media_dir(),
+            config.cache.media_ttl(),
+            config.cache.media_max_bytes(),
+        )
+        .await
+        {
             tracing::warn!(error = %err, "media cleanup failed");
         }
         tokio::time::sleep(Duration::from_secs(300)).await;
     }
 }
 
-pub async fn cleanup_once(media_dir: &Path, ttl: Duration) -> anyhow::Result<()> {
+pub async fn cleanup_once(
+    media_dir: &Path,
+    ttl: Option<Duration>,
+    max_bytes: Option<u64>,
+) -> anyhow::Result<()> {
     let mut entries = match fs::read_dir(media_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     };
+    let mut cached_files = Vec::new();
 
     while let Some(entry) = entries.next_entry().await? {
         let metadata = entry.metadata().await?;
-        if !metadata.is_file() {
+        let path = entry.path();
+        if !metadata.is_file() || !is_completed_media_file(&path) {
             continue;
         }
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if modified.elapsed().unwrap_or_default() > ttl {
-            fs::remove_file(entry.path()).await?;
+        if ttl
+            .map(|ttl| modified.elapsed().unwrap_or_default() > ttl)
+            .unwrap_or(false)
+        {
+            fs::remove_file(path).await?;
+            continue;
         }
+        cached_files.push(CachedMediaFile {
+            path,
+            modified,
+            bytes: metadata.len(),
+        });
+    }
+
+    let Some(max_bytes) = max_bytes else {
+        return Ok(());
+    };
+
+    let mut total_bytes = cached_files
+        .iter()
+        .map(|file| file.bytes)
+        .fold(0_u64, u64::saturating_add);
+    cached_files.sort_by_key(|file| file.modified);
+
+    for file in cached_files {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        fs::remove_file(&file.path).await?;
+        total_bytes = total_bytes.saturating_sub(file.bytes);
     }
 
     Ok(())
+}
+
+struct CachedMediaFile {
+    path: PathBuf,
+    modified: SystemTime,
+    bytes: u64,
+}
+
+fn is_completed_media_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    file_name.ends_with(".m4a") && !file_name.ends_with(".download.m4a")
 }
 
 pub fn download_error_response(err: anyhow::Error) -> (StatusCode, String) {
@@ -1522,11 +1580,51 @@ mod tests {
         let path = dir.path().join("old.m4a");
         fs::write(&path, b"old").await.unwrap();
 
-        cleanup_once(dir.path(), Duration::from_secs(0))
+        cleanup_once(dir.path(), Some(Duration::from_secs(0)), None)
             .await
             .unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_media_when_ttl_is_disabled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kept.m4a");
+        fs::write(&path, b"kept").await.unwrap();
+
+        cleanup_once(dir.path(), None, None).await.unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_trims_oldest_media_to_max_size() {
+        let dir = tempdir().unwrap();
+        let oldest = dir.path().join("oldest.m4a");
+        let newest = dir.path().join("newest.m4a");
+        fs::write(&oldest, b"old").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fs::write(&newest, b"new").await.unwrap();
+
+        cleanup_once(dir.path(), None, Some(3)).await.unwrap();
+
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_count_in_progress_downloads_against_max_size() {
+        let dir = tempdir().unwrap();
+        let complete = dir.path().join("complete.m4a");
+        let partial = dir.path().join("complete.m4a.download.m4a");
+        fs::write(&complete, b"complete").await.unwrap();
+        fs::write(&partial, b"partial-download").await.unwrap();
+
+        cleanup_once(dir.path(), None, Some(8)).await.unwrap();
+
+        assert!(complete.exists());
+        assert!(partial.exists());
     }
 
     #[test]

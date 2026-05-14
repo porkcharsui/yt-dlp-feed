@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -131,7 +129,7 @@ async fn download_audio(
 
     let key = cache_key(&user, "soundcloud", &account, &item.id);
     let path = media_path(&state.config, &key);
-    let ttl = Duration::from_secs(state.config.cache.media_ttl_seconds);
+    let ttl = state.config.cache.media_ttl();
 
     if is_fresh(&path, ttl).await {
         match tokio::fs::read(&path).await {

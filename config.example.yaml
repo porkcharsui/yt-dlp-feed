@@ -3,7 +3,10 @@ server:
 
 cache:
   data_dir: "./data"
-  media_ttl_seconds: 86400
+  media_ttl_minutes: 360
+  media_max_megabytes: 10240
+  disconnect_behavior: "delay_cancel"
+  disconnect_grace_seconds: 15
 
 auth:
   enabled: false

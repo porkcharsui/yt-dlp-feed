@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,8 @@ pub struct ServerConfig {
 #[serde(default)]
 pub struct CacheConfig {
     pub data_dir: PathBuf,
-    pub media_ttl_seconds: u64,
+    pub media_ttl_minutes: Option<u64>,
+    pub media_max_megabytes: Option<u64>,
     pub disconnect_behavior: DisconnectBehavior,
     pub disconnect_grace_seconds: u64,
 }
@@ -116,10 +118,23 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            media_ttl_seconds: 86_400,
+            media_ttl_minutes: Some(360),
+            media_max_megabytes: Some(10_240),
             disconnect_behavior: DisconnectBehavior::DelayCancel,
             disconnect_grace_seconds: 15,
         }
+    }
+}
+
+impl CacheConfig {
+    pub fn media_ttl(&self) -> Option<Duration> {
+        self.media_ttl_minutes
+            .map(|minutes| Duration::from_secs(minutes.saturating_mul(60)))
+    }
+
+    pub fn media_max_bytes(&self) -> Option<u64> {
+        self.media_max_megabytes
+            .map(|megabytes| megabytes.saturating_mul(1024 * 1024))
     }
 }
 
@@ -239,6 +254,10 @@ mod tests {
             DisconnectBehavior::DelayCancel
         );
         assert_eq!(config.cache.disconnect_grace_seconds, 15);
+        assert_eq!(config.cache.media_ttl_minutes, Some(360));
+        assert_eq!(config.cache.media_ttl(), Some(Duration::from_secs(21_600)));
+        assert_eq!(config.cache.media_max_megabytes, Some(10_240));
+        assert_eq!(config.cache.media_max_bytes(), Some(10_737_418_240));
 
         let nts = config
             .service("derek", ServiceKind::Soundcloud, "NTS")
@@ -267,7 +286,8 @@ server:
   bind: "0.0.0.0:9090"
 cache:
   data_dir: "/tmp/yt-dlp-feed"
-  media_ttl_seconds: 42
+  media_ttl_minutes: 42
+  media_max_megabytes: 1024
   disconnect_behavior: "cancel"
   disconnect_grace_seconds: 5
 auth:
@@ -293,7 +313,10 @@ users:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(config.server.bind, "0.0.0.0:9090");
-        assert_eq!(config.cache.media_ttl_seconds, 42);
+        assert_eq!(config.cache.media_ttl_minutes, Some(42));
+        assert_eq!(config.cache.media_ttl(), Some(Duration::from_secs(2_520)));
+        assert_eq!(config.cache.media_max_megabytes, Some(1024));
+        assert_eq!(config.cache.media_max_bytes(), Some(1_073_741_824));
         assert_eq!(config.cache.disconnect_behavior, DisconnectBehavior::Cancel);
         assert_eq!(config.cache.disconnect_grace_seconds, 5);
         assert!(config.auth.enabled);
@@ -330,5 +353,20 @@ cache:
 
             assert_eq!(config.cache.disconnect_behavior, expected);
         }
+    }
+
+    #[test]
+    fn parses_disabled_media_ttl_with_max_cache_size() {
+        let yaml = r#"
+cache:
+  media_ttl_minutes: null
+  media_max_megabytes: 2048
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.cache.media_ttl_minutes, None);
+        assert_eq!(config.cache.media_ttl(), None);
+        assert_eq!(config.cache.media_max_megabytes, Some(2048));
+        assert_eq!(config.cache.media_max_bytes(), Some(2_147_483_648));
     }
 }

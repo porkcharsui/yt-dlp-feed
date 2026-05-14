@@ -9,9 +9,9 @@ pub fn render_index(config: &Config) -> String {
                 let path = feed_path(&user.name, service.kind.as_path(), &service.account, *feed);
                 let source_url = feed.source_url(service);
                 let title = format!(
-                    "{} / {} / {}",
+                    "{}: {} / {}",
+                    service_display_name(service.kind.as_path()),
                     service.account,
-                    service.kind.as_path(),
                     feed.label()
                 );
                 feed_rows.push_str(&format!(
@@ -93,6 +93,13 @@ pub fn feed_path(user: &str, service: &str, account: &str, feed: SoundCloudFeedK
     )
 }
 
+fn service_display_name(service: &str) -> &str {
+    match service {
+        "soundcloud" => "SoundCloud",
+        _ => service,
+    }
+}
+
 fn escape_html(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -130,8 +137,8 @@ mod tests {
         assert!(html.contains(
             r#"<a class="source-url" href="https://soundcloud.com/dereknet">https://soundcloud.com/dereknet</a>"#
         ));
-        assert!(html.contains("<strong>NTS / soundcloud / Profile</strong>"));
-        assert!(html.contains("<strong>NTS / soundcloud / Popular Tracks</strong>"));
+        assert!(html.contains("<strong>SoundCloud: NTS / Profile</strong>"));
+        assert!(html.contains("<strong>SoundCloud: NTS / Popular Tracks</strong>"));
         assert!(!html.contains("derek / soundcloud / NTS Profile"));
         assert!(html.contains("RSS"));
     }

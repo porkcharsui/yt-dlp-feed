@@ -26,7 +26,8 @@ server:
 
 cache:
   data_dir: "./data"
-  media_ttl_seconds: 86400
+  media_ttl_minutes: 360
+  media_max_megabytes: 10240
   disconnect_behavior: "delay_cancel"
   disconnect_grace_seconds: 15
 
@@ -61,7 +62,7 @@ users:
 
 ## Download And Cache Behavior
 
-The server fetches feed metadata through the Rust [`yt-dlp`](https://github.com/boul2gom/yt-dlp) library. Audio downloads prefer the best available AAC stream and serve `audio/mp4` from `.m4a` URLs. If cached media exists and is still inside `media_ttl_seconds`, the server serves it directly. Otherwise, the first client request starts a new download, and concurrent requests for the same item share the same in-flight job.
+The server fetches feed metadata through the Rust [`yt-dlp`](https://github.com/boul2gom/yt-dlp) library. Audio downloads prefer the best available AAC stream and serve `audio/mp4` from `.m4a` URLs. If cached media exists and is still inside `media_ttl_minutes`, the server serves it directly. If `media_ttl_minutes` is `null`, existing cached media is considered reusable until another cleanup limit removes it. Otherwise, the first client request starts a new download, and concurrent requests for the same item share the same in-flight job.
 
 If every client disconnects while a download is still in flight, `cache.disconnect_behavior` controls whether the server keeps or cancels the orphaned download:
 
@@ -69,7 +70,14 @@ If every client disconnects while a download is still in flight, `cache.disconne
 - `cancel` stops `yt-dlp` immediately and removes the partial `.download.m4a`.
 - `delay_cancel` waits `disconnect_grace_seconds` for a reconnect, then cancels if no client is attached.
 
-Completed media files live under `cache.data_dir` and are cleaned up after the configured TTL. This is intentional: clients are expected to cache media after the first successful fetch.
+Completed media files live under `cache.data_dir` and are cleaned up by the background cache cleaner every five minutes. This is intentional: clients are expected to cache media after the first successful fetch.
+
+Cache cleanup supports either or both of these limits:
+
+- `media_ttl_minutes` removes completed `.m4a` files older than the configured age. The default is `360`, or 6 hours. Set it to `null` to disable age-based cleanup.
+- `media_max_megabytes` keeps completed `.m4a` files under the configured total size, measured in MiB, by deleting the oldest files first. For example, `10240` allows about 10 GiB. Set it to `null` or omit it to disable size-based cleanup.
+
+When both limits are configured, TTL cleanup runs first, then the remaining completed media files are trimmed to `media_max_megabytes`. In-progress `.download.m4a` files are not counted against the size limit.
 
 ## Security
 

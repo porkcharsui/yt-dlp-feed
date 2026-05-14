@@ -37,7 +37,8 @@ If `config.yaml` is absent, the server should still start with:
 
 - bind address `127.0.0.1:8080`
 - data directory `./data`
-- media TTL `86400` seconds
+- media TTL `360` minutes
+- media max megabytes `10240`
 - auth disabled
 - user `derek`
 - SoundCloud account `dereknet`
@@ -63,7 +64,7 @@ Cover these behaviors with unit or integration tests:
 - Optional Basic auth accepts valid credentials and rejects invalid requests.
 - Cache keys and media paths are stable.
 - Concurrent requests for the same item share one in-flight download.
-- Expired media files are removed by cleanup.
+- Expired media files are removed by cleanup, and an optional megabyte cap trims oldest completed media files first.
 
 Live yt-dlp/SoundCloud tests should be ignored by default or feature-gated.
 
