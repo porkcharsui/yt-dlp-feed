@@ -70,7 +70,8 @@ pub struct UserConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceConfig {
     pub kind: ServiceKind,
-    pub account: String,
+    #[serde(alias = "account")]
+    pub name: String,
     pub profile_url: String,
     #[serde(default = "default_soundcloud_feeds")]
     pub feeds: Vec<SoundCloudFeedKind>,
@@ -102,13 +103,13 @@ impl Default for Config {
                 services: vec![
                     ServiceConfig {
                         kind: ServiceKind::Soundcloud,
-                        account: "dereknet".to_string(),
+                        name: "dereknet".to_string(),
                         profile_url: "https://soundcloud.com/dereknet".to_string(),
                         feeds: default_soundcloud_feeds(),
                     },
                     ServiceConfig {
                         kind: ServiceKind::Soundcloud,
-                        account: "NTS".to_string(),
+                        name: "NTS".to_string(),
                         profile_url: "https://soundcloud.com/user-202286394-991268468".to_string(),
                         feeds: default_soundcloud_feeds(),
                     },
@@ -219,19 +220,14 @@ impl Config {
         self.cache.data_dir.join("libs")
     }
 
-    pub fn service(
-        &self,
-        user: &str,
-        service: ServiceKind,
-        account: &str,
-    ) -> Option<&ServiceConfig> {
+    pub fn service(&self, user: &str, service: ServiceKind, name: &str) -> Option<&ServiceConfig> {
         self.users
             .iter()
             .find(|candidate| candidate.name == user)
             .and_then(|user| {
                 user.services
                     .iter()
-                    .find(|candidate| candidate.kind == service && candidate.account == account)
+                    .find(|candidate| candidate.kind == service && candidate.name == name)
             })
     }
 
@@ -287,13 +283,13 @@ impl Config {
                 tracing::warn!("configured user has an empty name");
             }
             for service in &user.services {
-                if service.account.trim().is_empty() {
-                    tracing::warn!(user = %user.name, "configured service has an empty account");
+                if service.name.trim().is_empty() {
+                    tracing::warn!(user = %user.name, "configured service has an empty name");
                 }
                 if service.profile_url.trim().is_empty() {
                     tracing::warn!(
                         user = %user.name,
-                        account = %service.account,
+                        name = %service.name,
                         "configured service has an empty profile_url"
                     );
                 } else if !service.profile_url.starts_with("http://")
@@ -301,18 +297,18 @@ impl Config {
                 {
                     tracing::warn!(
                         user = %user.name,
-                        account = %service.account,
+                        name = %service.name,
                         profile_url = %service.profile_url,
                         "configured profile_url does not start with http:// or https://"
                     );
                 }
 
-                let key = (user.name.as_str(), service.kind, service.account.as_str());
+                let key = (user.name.as_str(), service.kind, service.name.as_str());
                 if !service_keys.insert(key) {
                     tracing::warn!(
                         user = %user.name,
                         service = %service.kind.as_path(),
-                        account = %service.account,
+                        name = %service.name,
                         "duplicate configured service route"
                     );
                 }
@@ -323,7 +319,7 @@ impl Config {
                         tracing::warn!(
                             user = %user.name,
                             service = %service.kind.as_path(),
-                            account = %service.account,
+                            name = %service.name,
                             feed = %feed.slug(),
                             "duplicate feed kind configured"
                         );
@@ -463,13 +459,13 @@ users:
   - name: "derek"
     services:
       - kind: "soundcloud"
-        account: "dereknet"
+        name: "dereknet"
         profile_url: "https://soundcloud.com/dereknet"
         feeds:
           - profile
           - likes
       - kind: "soundcloud"
-        account: "NTS"
+        name: "NTS"
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
@@ -495,6 +491,28 @@ users:
                 .unwrap()
                 .feeds,
             vec![SoundCloudFeedKind::Profile, SoundCloudFeedKind::Likes]
+        );
+    }
+
+    #[test]
+    fn parses_legacy_account_as_service_name() {
+        let yaml = r#"
+users:
+  - name: "derek"
+    services:
+      - kind: "soundcloud"
+        account: "NTS"
+        profile_url: "https://soundcloud.com/user-202286394-991268468"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let service = config
+            .service("derek", ServiceKind::Soundcloud, "NTS")
+            .expect("legacy account alias should become service name");
+
+        assert_eq!(service.name, "NTS");
+        assert_eq!(
+            SoundCloudFeedKind::Likes.source_url(service),
+            "https://soundcloud.com/user-202286394-991268468/likes"
         );
     }
 

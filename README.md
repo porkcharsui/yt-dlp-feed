@@ -1,8 +1,8 @@
 # yt-dlp-feed
 
-`yt-dlp-feed` is a Rust HTTP server that turns configured yt-dlp-supported accounts into podcast-style RSS feeds. Feed items point at stable server URLs that perform just-in-time downloads with `yt-dlp`, stream the audio back to the client, and keep the downloaded media only temporarily.
+`yt-dlp-feed` is a Rust HTTP server that turns configured yt-dlp-supported sources into podcast-style RSS feeds. Feed items point at stable server URLs that perform just-in-time downloads with `yt-dlp`, stream the audio back to the client, and keep the downloaded media only temporarily.
 
-The first target service is SoundCloud. The default config exposes the main profile and likes feeds for Derek's SoundCloud account, [`dereknet`](https://soundcloud.com/dereknet), plus the profile and popular tracks feeds for [`NTS`](https://soundcloud.com/user-202286394-991268468).
+The first target service is SoundCloud. A configured SoundCloud source can expose a profile feed, a likes feed, or both.
 
 ## Status
 
@@ -10,7 +10,7 @@ This repository contains the first Rust implementation scaffold: config loading,
 
 ## Supported Services
 
-The server is designed around yt-dlp-compatible sources. v1 implements SoundCloud account feeds, and future services should use the same internal service boundary.
+The server is designed around yt-dlp-compatible sources. V1 implements SoundCloud profile feeds; other services can be added later by teaching the app how to fetch their feed metadata and download their media.
 
 For the broader list of services that yt-dlp may support, see the canonical yt-dlp documentation:
 
@@ -18,7 +18,7 @@ For the broader list of services that yt-dlp may support, see the canonical yt-d
 
 ## Configuration
 
-By default, the server looks for `config.yaml`. If no config exists, it uses the built-in Derek/SoundCloud defaults. You can also pass a path with `--config` or `YT_DLP_FEED_CONFIG`.
+By default, the server looks for `config.yaml`. If no config exists, it uses built-in example SoundCloud defaults. You can also pass a path with `--config` or `YT_DLP_FEED_CONFIG`.
 
 ```yaml
 server:
@@ -42,17 +42,11 @@ auth:
   enabled: false
 
 users:
-  - name: "derek"
+  - name: "operator"
     services:
       - kind: "soundcloud"
-        account: "dereknet"
-        profile_url: "https://soundcloud.com/dereknet"
-        feeds:
-          - profile
-          - likes
-      - kind: "soundcloud"
-        account: "NTS"
-        profile_url: "https://soundcloud.com/user-202286394-991268468"
+        name: "primary"
+        profile_url: "https://soundcloud.com/example-profile"
         feeds:
           - profile
           - likes
@@ -64,9 +58,9 @@ users:
 - `GET /index.json` serves the same configured feed/status data in structured JSON.
 - `GET /healthz` returns `ok`.
 - `GET /readyz` returns `ready` only after every configured feed has metadata cached at least once.
-- `GET /users/{user}/soundcloud/{account}/feed.xml` serves the account profile feed.
-- `GET /users/{user}/soundcloud/{account}/likes.xml` serves the account likes feed.
-- `GET /users/{user}/soundcloud/{account}/items/{item_id}/audio.m4a` downloads or serves cached AAC/M4A audio for a feed item.
+- `GET /users/{user}/soundcloud/{name}/feed.xml` serves the profile feed.
+- `GET /users/{user}/soundcloud/{name}/likes.xml` serves the likes feed.
+- `GET /users/{user}/soundcloud/{name}/items/{item_id}/audio.m4a` downloads or serves cached AAC/M4A audio for a feed item.
 
 ## Cache Design
 
@@ -116,14 +110,52 @@ When both limits are configured, TTL cleanup runs first, then the remaining comp
 
 ## Security
 
-The default deployment model is a trusted network, such as a LAN, or deployment behind an auth proxy. Built-in auth is intentionally simple. If `auth.enabled` is true, configure HTTP Basic auth credentials in `config.yaml`:
+The V1 security model is intentionally small and explicit. The server is meant
+for a single trusted operator on a LAN, private network, VPN, or behind a real
+access-control layer such as Tailscale or an auth proxy. It is not designed as a
+public multi-tenant service.
+
+The `users` section in the config is still meaningful even for a single
+operator. A configured user is the owner of one or more feed sources, and that
+user name is part of every feed URL:
+
+```text
+/users/{user}/soundcloud/{name}/feed.xml
+```
+
+For example, this config says that the authenticated app user `operator` owns a
+SoundCloud source labelled `primary`:
+
+```yaml
+users:
+  - name: "operator"
+    services:
+      - kind: "soundcloud"
+        name: "primary"
+        profile_url: "https://soundcloud.com/example-profile"
+```
+
+Built-in auth uses one HTTP Basic username/password pair. If `auth.enabled` is
+true, the Basic auth username is treated as the configured app user name. A user
+authenticated as `operator` can access `/users/operator/...`; requests for another
+configured user path return `403 Forbidden`. The HTML index and `index.json`
+are also filtered to the authenticated user.
 
 ```yaml
 auth:
   enabled: true
-  username: "derek"
+  username: "operator"
   password: "change-me"
 ```
+
+If `auth.enabled` is false, the app trusts the surrounding network or proxy and
+does not enforce per-user access. In that mode, anyone who can reach the server
+can see the index and request any configured feed URL. The app logs a warning
+when auth is disabled while binding to `0.0.0.0`.
+
+V1 deliberately does not include browser sessions, OAuth, per-user password
+lists, admin screens, or multi-user isolation. Add those only if the deployment
+model changes from "single trusted operator" to "shared service."
 
 ## Development
 

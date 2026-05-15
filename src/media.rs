@@ -1045,13 +1045,13 @@ fn default_shutdown_receiver() -> watch::Receiver<bool> {
     rx
 }
 
-pub fn cache_key(user: &str, service: &str, account: &str, item_id: &str) -> String {
+pub fn cache_key(user: &str, service: &str, name: &str, item_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(user.as_bytes());
     hasher.update([0]);
     hasher.update(service.as_bytes());
     hasher.update([0]);
-    hasher.update(account.as_bytes());
+    hasher.update(name.as_bytes());
     hasher.update([0]);
     hasher.update(item_id.as_bytes());
     hex(&hasher.finalize())

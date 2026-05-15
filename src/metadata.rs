@@ -18,7 +18,8 @@ const LAST_ERROR_LIMIT: usize = 500;
 pub struct FeedIdentity {
     pub user: String,
     pub service: ServiceKind,
-    pub account: String,
+    #[serde(alias = "account")]
+    pub name: String,
     pub feed: SoundCloudFeedKind,
 }
 
@@ -27,7 +28,8 @@ pub struct CachedFeedMetadata {
     pub schema_version: u32,
     pub user: String,
     pub service: ServiceKind,
-    pub account: String,
+    #[serde(alias = "account")]
+    pub name: String,
     pub feed: SoundCloudFeedKind,
     pub source_url: String,
     pub last_successful_refresh: DateTime<Utc>,
@@ -62,10 +64,12 @@ impl MetadataCacheState {
 pub struct FeedStatus {
     pub user: String,
     pub service: String,
-    pub account: String,
+    pub name: String,
     pub feed: String,
     pub title: String,
     pub source_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<usize>,
     pub metadata_cache: MetadataCacheStatus,
 }
 
@@ -199,6 +203,15 @@ impl MetadataCache {
         service: &ServiceConfig,
     ) -> MetadataCacheStatus {
         let cached = self.get(identity).await;
+        self.status_from_cached(identity, service, cached).await
+    }
+
+    async fn status_from_cached(
+        &self,
+        identity: &FeedIdentity,
+        service: &ServiceConfig,
+        cached: Option<CachedFeedMetadata>,
+    ) -> MetadataCacheStatus {
         let inner = self.inner.lock().await;
         let runtime = inner.statuses.get(identity);
         let refreshing = runtime.map(|status| status.refreshing).unwrap_or(false);
@@ -212,13 +225,13 @@ impl MetadataCache {
             (true, false, false) => MetadataCacheState::Ready,
         };
 
-        let last_successful_refresh = cached.map(|cache| cache.last_successful_refresh);
+        let last_successful_refresh = cached.as_ref().map(|cache| cache.last_successful_refresh);
         drop(inner);
 
         tracing::trace!(
             user = %identity.user,
             service = %identity.service.as_path(),
-            account = %identity.account,
+            name = %identity.name,
             feed = %identity.feed.slug(),
             source_url = %identity.feed.source_url(service),
             state = ?state,
@@ -234,17 +247,30 @@ impl MetadataCache {
     }
 
     pub async fn index_json(&self) -> IndexJson {
+        self.index_json_for_user(None).await
+    }
+
+    pub async fn index_json_for_user(&self, only_user: Option<&str>) -> IndexJson {
         let mut feeds = Vec::new();
 
         for (identity, service) in self.configured_feeds() {
-            let status = self.status(&identity, &service).await;
+            if only_user.is_some_and(|user| identity.user != user) {
+                continue;
+            }
+            let cached = self.get(&identity).await;
+            let item_count = cached
+                .as_ref()
+                .map(|cache| cache.items.len())
+                .filter(|count| *count > 0);
+            let status = self.status_from_cached(&identity, &service, cached).await;
             feeds.push(FeedStatus {
                 user: identity.user.clone(),
                 service: identity.service.as_path().to_string(),
-                account: identity.account.clone(),
+                name: identity.name.clone(),
                 feed: identity.feed.slug().to_string(),
                 title: feed_title(&service, identity.feed),
                 source_url: identity.feed.source_url(&service),
+                item_count,
                 metadata_cache: status,
             });
         }
@@ -298,7 +324,7 @@ impl MetadataCache {
             schema_version: SCHEMA_VERSION,
             user: identity.user.clone(),
             service: identity.service,
-            account: identity.account.clone(),
+            name: identity.name.clone(),
             feed: identity.feed,
             source_url: identity.feed.source_url(service),
             last_successful_refresh: Utc::now(),
@@ -348,7 +374,7 @@ impl MetadataCache {
         tracing::info!(
             user = %identity.user,
             service = %identity.service.as_path(),
-            account = %identity.account,
+            name = %identity.name,
             feed = %identity.feed.slug(),
             priority = ?priority,
             queue_size,
@@ -383,7 +409,7 @@ impl MetadataCache {
                 tracing::debug!(
                     user = %identity.user,
                     service = %identity.service.as_path(),
-                    account = %identity.account,
+                    name = %identity.name,
                     feed = %identity.feed.slug(),
                     "metadata scheduled refresh skipped because cache is recent"
                 );
@@ -446,7 +472,7 @@ impl MetadataCache {
             tracing::info!(
                 user = %job.identity.user,
                 service = %job.identity.service.as_path(),
-                account = %job.identity.account,
+                name = %job.identity.name,
                 feed = %job.identity.feed.slug(),
                 queue_size,
                 "metadata refresh started"
@@ -459,7 +485,7 @@ impl MetadataCache {
                     schema_version: SCHEMA_VERSION,
                     user: job.identity.user.clone(),
                     service: job.identity.service,
-                    account: job.identity.account.clone(),
+                    name: job.identity.name.clone(),
                     feed: job.identity.feed,
                     source_url: job.source_url.clone(),
                     last_successful_refresh: Utc::now(),
@@ -547,7 +573,7 @@ impl MetadataCache {
             RefreshOutcome::Refreshed => tracing::info!(
                 user = %identity.user,
                 service = %identity.service.as_path(),
-                account = %identity.account,
+                name = %identity.name,
                 feed = %identity.feed.slug(),
                 queue_size,
                 "metadata refresh completed"
@@ -555,7 +581,7 @@ impl MetadataCache {
             RefreshOutcome::Failed(state) => tracing::warn!(
                 user = %identity.user,
                 service = %identity.service.as_path(),
-                account = %identity.account,
+                name = %identity.name,
                 feed = %identity.feed.slug(),
                 state = state.as_header_value(),
                 queue_size,
@@ -575,7 +601,7 @@ impl MetadataCache {
                         FeedIdentity {
                             user: user.name.clone(),
                             service: service.kind,
-                            account: service.account.clone(),
+                            name: service.name.clone(),
                             feed: *feed,
                         },
                         service.clone(),
@@ -645,7 +671,7 @@ pub fn identity_for(user: &str, service: &ServiceConfig, feed: SoundCloudFeedKin
     FeedIdentity {
         user: user.to_string(),
         service: service.kind,
-        account: service.account.clone(),
+        name: service.name.clone(),
         feed,
     }
 }
@@ -654,7 +680,7 @@ pub fn feed_title(service: &ServiceConfig, feed: SoundCloudFeedKind) -> String {
     format!(
         "{}: {} / {}",
         service_display_name(service.kind.as_path()),
-        service.account,
+        service.name,
         feed.label()
     )
 }
@@ -671,7 +697,7 @@ fn cache_file_stem(identity: &FeedIdentity) -> String {
         "{}__{}__{}__{}",
         safe_part(&identity.user),
         safe_part(identity.service.as_path()),
-        safe_part(&identity.account),
+        safe_part(&identity.name),
         safe_part(identity.feed.slug())
     );
     format!("{}__{}", readable, &identity_hash(identity)[..12])
@@ -683,7 +709,7 @@ fn identity_hash(identity: &FeedIdentity) -> String {
     hasher.update([0]);
     hasher.update(identity.service.as_path().as_bytes());
     hasher.update([0]);
-    hasher.update(identity.account.as_bytes());
+    hasher.update(identity.name.as_bytes());
     hasher.update([0]);
     hasher.update(identity.feed.slug().as_bytes());
     hex(&hasher.finalize())

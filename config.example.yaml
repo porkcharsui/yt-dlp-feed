@@ -22,21 +22,25 @@ users:
   - name: "derek"
     services:
       - kind: "soundcloud"
-        account: "dereknet"
+        name: "dereknet"
         profile_url: "https://soundcloud.com/dereknet"
         feeds:
           - profile
           - likes 
       - kind: "soundcloud"
-        account: "NTS"
+        name: "NTS"
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
+      - kind: "soundcloud"
+        name: "FourTet"
+        profile_url: "https://soundcloud.com/four-tet"
+        feeds:
+          - profile
+      - kind: "soundcloud"
+        name: "Caribou"
+        profile_url: "https://soundcloud.com/caribouband"
+        feeds:
+          - profile
 
-  # - name: "NTS"
-  #   services:
-  #     - kind: "soundcloud"
-  #       account: "NTS Latest"
-  #       profile_url: "https://soundcloud.com/user-202286394-991268468"
-  #       feeds:
-  #         - profile
+

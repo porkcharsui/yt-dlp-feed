@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -11,6 +11,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use httpdate::{fmt_http_date, parse_http_date};
 
+use crate::auth::AuthenticatedUser;
 use crate::config::{ServiceKind, SoundCloudFeedKind};
 use crate::media::{cache_key, is_fresh, media_path, stream_download, FeedItem};
 use crate::metadata::{identity_for, MetadataCacheState, RefreshOutcome, RefreshPriority};
@@ -26,28 +27,35 @@ pub fn router(state: AppState) -> Router {
         .route("/index.json", get(index_json))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/users/:user/soundcloud/:name/feed.xml", get(profile_feed))
+        .route("/users/:user/soundcloud/:name/likes.xml", get(likes_feed))
         .route(
-            "/users/:user/soundcloud/:account/feed.xml",
-            get(profile_feed),
-        )
-        .route(
-            "/users/:user/soundcloud/:account/likes.xml",
-            get(likes_feed),
-        )
-        .route(
-            "/users/:user/soundcloud/:account/items/:item_id/audio.m4a",
+            "/users/:user/soundcloud/:name/items/:item_id/audio.m4a",
             get(download_audio),
         )
         .with_state(state)
 }
 
-async fn index(State(state): State<AppState>) -> Html<String> {
-    let index = state.metadata.index_json().await;
-    Html(crate::html::render_index(&state.config, &index))
+async fn index(
+    State(state): State<AppState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+) -> Response {
+    let only_user = authenticated_config_user(&state, auth_user_name(auth_user.as_ref()));
+    let index = state.metadata.index_json_for_user(only_user).await;
+    Html(crate::html::render_index_for_user(
+        &state.config,
+        &index,
+        only_user,
+    ))
+    .into_response()
 }
 
-async fn index_json(State(state): State<AppState>) -> Response {
-    match serde_json::to_string_pretty(&state.metadata.index_json().await) {
+async fn index_json(
+    State(state): State<AppState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+) -> Response {
+    let only_user = authenticated_config_user(&state, auth_user_name(auth_user.as_ref()));
+    match serde_json::to_string_pretty(&state.metadata.index_json_for_user(only_user).await) {
         Ok(json) => (
             [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
             json,
@@ -74,18 +82,55 @@ async fn readyz(State(state): State<AppState>) -> Response {
     }
 }
 
+fn auth_user_name(auth_user: Option<&Extension<AuthenticatedUser>>) -> Option<&String> {
+    auth_user.map(|user| &user.0 .0)
+}
+
+fn authenticated_config_user<'a>(
+    state: &AppState,
+    auth_user: Option<&'a String>,
+) -> Option<&'a str> {
+    if state.config.auth.enabled {
+        auth_user.map(String::as_str)
+    } else {
+        None
+    }
+}
+
+fn authorize_config_user(
+    state: &AppState,
+    auth_user: Option<&String>,
+    requested_user: &str,
+) -> Result<(), Response> {
+    if !state.config.auth.enabled {
+        return Ok(());
+    }
+
+    match auth_user {
+        Some(auth_user) if auth_user == requested_user => Ok(()),
+        Some(_) => Err(StatusCode::FORBIDDEN.into_response()),
+        None => Err(StatusCode::UNAUTHORIZED.into_response()),
+    }
+}
+
 async fn profile_feed(
     State(state): State<AppState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    Path((user, account)): Path<(String, String)>,
+    Path((user, name)): Path<(String, String)>,
 ) -> Response {
+    if let Err(response) = authorize_config_user(&state, auth_user_name(auth_user.as_ref()), &user)
+    {
+        return response;
+    }
+
     render_soundcloud_feed(
         state,
         headers,
         query,
         user,
-        account,
+        name,
         SoundCloudFeedKind::Profile,
     )
     .await
@@ -93,19 +138,17 @@ async fn profile_feed(
 
 async fn likes_feed(
     State(state): State<AppState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    Path((user, account)): Path<(String, String)>,
+    Path((user, name)): Path<(String, String)>,
 ) -> Response {
-    render_soundcloud_feed(
-        state,
-        headers,
-        query,
-        user,
-        account,
-        SoundCloudFeedKind::Likes,
-    )
-    .await
+    if let Err(response) = authorize_config_user(&state, auth_user_name(auth_user.as_ref()), &user)
+    {
+        return response;
+    }
+
+    render_soundcloud_feed(state, headers, query, user, name, SoundCloudFeedKind::Likes).await
 }
 
 async fn render_soundcloud_feed(
@@ -113,12 +156,12 @@ async fn render_soundcloud_feed(
     headers: HeaderMap,
     query: HashMap<String, String>,
     user: String,
-    account: String,
+    name: String,
     feed: SoundCloudFeedKind,
 ) -> Response {
     let Some(service) = state
         .config
-        .service(&user, ServiceKind::Soundcloud, &account)
+        .service(&user, ServiceKind::Soundcloud, &name)
         .cloned()
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -222,12 +265,18 @@ async fn render_soundcloud_feed(
 async fn download_audio(
     method: Method,
     State(state): State<AppState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     headers: HeaderMap,
-    Path((user, account, item_id)): Path<(String, String, String)>,
+    Path((user, name, item_id)): Path<(String, String, String)>,
 ) -> Response {
+    if let Err(response) = authorize_config_user(&state, auth_user_name(auth_user.as_ref()), &user)
+    {
+        return response;
+    }
+
     let Some(service) = state
         .config
-        .service(&user, ServiceKind::Soundcloud, &account)
+        .service(&user, ServiceKind::Soundcloud, &name)
         .cloned()
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -237,7 +286,7 @@ async fn download_audio(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let key = cache_key(&user, "soundcloud", &account, &item.id);
+    let key = cache_key(&user, "soundcloud", &name, &item.id);
     let path = media_path(&state.config, &key);
     let ttl = state.config.cache.media_ttl();
 
@@ -563,6 +612,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_user_must_match_route_user() {
+        let mut config = Config::default();
+        config.auth.enabled = true;
+        config.auth.username = Some("derek".to_string());
+        config.auth.password = Some("secret".to_string());
+        let app = test_router_with_config(config).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/users/someone-else/soundcloud/dereknet/feed.xml")
+                    .extension(AuthenticatedUser("derek".to_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn index_json_contains_metadata_status_summary() {
         let app = test_router().await;
         let response = app
@@ -583,6 +654,9 @@ mod tests {
 
         assert_eq!(json["summary"]["feeds_missing"], 0);
         assert_eq!(json["feeds"][0]["metadata_cache"]["state"], "ready");
+        assert!(json["feeds"][0].get("name").is_some());
+        assert_eq!(json["feeds"][0]["item_count"], 2);
+        assert!(json["feeds"][0].get("account").is_none());
         assert!(json["feeds"][0].get("rss_path").is_none());
         assert!(json["feeds"][0].get("rss_url").is_none());
     }
@@ -645,8 +719,11 @@ mod tests {
     }
 
     async fn test_router() -> Router {
+        test_router_with_config(Config::default()).await
+    }
+
+    async fn test_router_with_config(mut config: Config) -> Router {
         let dir = tempdir().unwrap();
-        let mut config = Config::default();
         config.cache.data_dir = dir.keep();
         let coordinator = Arc::new(DownloadCoordinator::from_arc(Arc::new(MockBackend)));
         let metadata = Arc::new(MetadataCache::new(config.clone()).await.unwrap());
@@ -671,26 +748,26 @@ mod tests {
         router(AppState::new(config, coordinator, metadata))
     }
 
-    fn configured_feed_path(account: &str, feed: SoundCloudFeedKind) -> String {
+    fn configured_feed_path(name: &str, feed: SoundCloudFeedKind) -> String {
         let config = Config::default();
         let user = &config.users[0];
         let service = config
-            .service(&user.name, ServiceKind::Soundcloud, account)
+            .service(&user.name, ServiceKind::Soundcloud, name)
             .expect("configured test service");
-        feed_path(&user.name, service.kind.as_path(), &service.account, feed)
+        feed_path(&user.name, service.kind.as_path(), &service.name, feed)
     }
 
-    fn configured_media_url(account: &str, item_id: &str) -> String {
+    fn configured_media_url(name: &str, item_id: &str) -> String {
         let config = Config::default();
         let user = &config.users[0];
         let service = config
-            .service(&user.name, ServiceKind::Soundcloud, account)
+            .service(&user.name, ServiceKind::Soundcloud, name)
             .expect("configured test service");
         format!(
             "http://example.test/users/{}/{}/{}/items/{}/audio.m4a",
             urlencoding::encode(&user.name),
             urlencoding::encode(service.kind.as_path()),
-            urlencoding::encode(&service.account),
+            urlencoding::encode(&service.name),
             urlencoding::encode(item_id)
         )
     }

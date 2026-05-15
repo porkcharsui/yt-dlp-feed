@@ -17,12 +17,12 @@ pub fn render_feed(
     items: &[FeedItem],
     last_successful_refresh: DateTime<Utc>,
 ) -> anyhow::Result<String> {
-    let feed_path = crate::html::feed_path(user, service.kind.as_path(), &service.account, feed);
+    let feed_path = crate::html::feed_path(user, service.kind.as_path(), &service.name, feed);
     let channel_link = format!("{base_url}{feed_path}");
     let source_url = feed.source_url(service);
     let title = format!(
         "{} {} {}",
-        service.account,
+        service.name,
         service.kind.as_path(),
         feed.label()
     );
@@ -34,7 +34,7 @@ pub fn render_feed(
                 "{base_url}/users/{}/{}/{}/items/{}/audio.m4a",
                 urlencoding::encode(user),
                 urlencoding::encode(service.kind.as_path()),
-                urlencoding::encode(&service.account),
+                urlencoding::encode(&service.name),
                 urlencoding::encode(&item.id)
             );
             let enclosure = EnclosureBuilder::default()

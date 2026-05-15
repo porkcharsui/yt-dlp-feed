@@ -10,6 +10,9 @@ use tower::{Layer, Service};
 
 use crate::config::AuthConfig;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedUser(pub String);
+
 #[derive(Debug, Clone)]
 pub struct AuthLayer {
     config: AuthConfig,
@@ -52,7 +55,14 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        if !self.config.enabled || request_is_authorized(&self.config, &req) {
+        if !self.config.enabled {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(req).await });
+        }
+
+        if let Some(username) = authenticated_username(&self.config, &req) {
+            let mut req = req;
+            req.extensions_mut().insert(AuthenticatedUser(username));
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(req).await });
         }
@@ -68,28 +78,36 @@ where
 }
 
 pub fn request_is_authorized(config: &AuthConfig, req: &Request<Body>) -> bool {
+    authenticated_username(config, req).is_some()
+}
+
+pub fn authenticated_username(config: &AuthConfig, req: &Request<Body>) -> Option<String> {
     let Some(expected_user) = config.username.as_deref() else {
-        return false;
+        return None;
     };
     let Some(expected_password) = config.password.as_deref() else {
-        return false;
+        return None;
     };
     let Some(header) = req.headers().get(AUTHORIZATION) else {
-        return false;
+        return None;
     };
     let Ok(header) = header.to_str() else {
-        return false;
+        return None;
     };
     let Some(encoded) = header.strip_prefix("Basic ") else {
-        return false;
+        return None;
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return false;
+        return None;
     };
     let Ok(credentials) = String::from_utf8(decoded) else {
-        return false;
+        return None;
     };
-    credentials == format!("{expected_user}:{expected_password}")
+    if credentials == format!("{expected_user}:{expected_password}") {
+        Some(expected_user.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +138,9 @@ mod tests {
             .unwrap();
 
         assert!(request_is_authorized(&config, &request));
+        assert_eq!(
+            authenticated_username(&config, &request).as_deref(),
+            Some("derek")
+        );
     }
 }

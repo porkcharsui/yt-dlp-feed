@@ -2,17 +2,28 @@ use crate::config::{Config, SoundCloudFeedKind};
 use crate::metadata::{FeedStatus, IndexJson};
 
 pub fn render_index(config: &Config, index: &IndexJson) -> String {
+    render_index_for_user(config, index, None)
+}
+
+pub fn render_index_for_user(
+    config: &Config,
+    index: &IndexJson,
+    only_user: Option<&str>,
+) -> String {
     let mut feed_rows = String::new();
 
     for user in &config.users {
+        if only_user.is_some_and(|only_user| user.name != only_user) {
+            continue;
+        }
         for service in &user.services {
             for feed in &service.feeds {
-                let path = feed_path(&user.name, service.kind.as_path(), &service.account, *feed);
+                let path = feed_path(&user.name, service.kind.as_path(), &service.name, *feed);
                 let source_url = feed.source_url(service);
                 let title = format!(
                     "{}: {} / {}",
                     service_display_name(service.kind.as_path()),
-                    service.account,
+                    service.name,
                     feed.label()
                 );
                 let status = index.feeds.iter().find(|candidate| {
@@ -20,7 +31,7 @@ pub fn render_index(config: &Config, index: &IndexJson) -> String {
                         candidate,
                         &user.name,
                         service.kind.as_path(),
-                        &service.account,
+                        &service.name,
                         feed.slug(),
                     )
                 });
@@ -31,6 +42,10 @@ pub fn render_index(config: &Config, index: &IndexJson) -> String {
                     .and_then(|status| status.metadata_cache.last_successful_refresh)
                     .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
                     .unwrap_or_else(|| "never".to_string());
+                let item_count = status
+                    .and_then(|status| status.item_count)
+                    .map(|count| format!(" · Items: {count}"))
+                    .unwrap_or_default();
                 let refresh_path = format!("{path}?refresh=1");
                 feed_rows.push_str(&format!(
                     r#"<article class="feed">
@@ -38,7 +53,7 @@ pub fn render_index(config: &Config, index: &IndexJson) -> String {
   <span>
     <a class="source" href="{source_url}"><strong>{title}</strong></a>
     <small><a class="source-url" href="{source_url}">{source_url_text}</a></small>
-    <small>State: {state} · Last fetched (UTC): {last_fetched}</small>
+    <small>State: {state} · Last fetched (UTC): {last_fetched}{item_count}</small>
   </span>
   <span class="actions">
     <a class="rss" href="{path}" aria-label="RSS feed for {title_attr}">RSS</a>
@@ -52,6 +67,7 @@ pub fn render_index(config: &Config, index: &IndexJson) -> String {
                     title = escape_html(&title),
                     state = escape_html(state),
                     last_fetched = escape_html(&last_fetched),
+                    item_count = escape_html(&item_count),
                     title_attr = escape_attr(&title)
                 ));
             }
@@ -100,7 +116,7 @@ pub fn render_index(config: &Config, index: &IndexJson) -> String {
 <body>
   <main>
     <h1>yt-dlp-feed</h1>
-    <p>Podcast feeds generated from configured yt-dlp service accounts.</p>
+    <p>Podcast feeds generated from configured yt-dlp sources.</p>
     <section class="feeds" aria-label="Available feeds">
       {feed_rows}
     </section>
@@ -110,19 +126,16 @@ pub fn render_index(config: &Config, index: &IndexJson) -> String {
     )
 }
 
-fn matches_feed(status: &FeedStatus, user: &str, service: &str, account: &str, feed: &str) -> bool {
-    status.user == user
-        && status.service == service
-        && status.account == account
-        && status.feed == feed
+fn matches_feed(status: &FeedStatus, user: &str, service: &str, name: &str, feed: &str) -> bool {
+    status.user == user && status.service == service && status.name == name && status.feed == feed
 }
 
-pub fn feed_path(user: &str, service: &str, account: &str, feed: SoundCloudFeedKind) -> String {
+pub fn feed_path(user: &str, service: &str, name: &str, feed: SoundCloudFeedKind) -> String {
     format!(
         "/users/{}/{}/{}/{}",
         urlencoding::encode(user),
         urlencoding::encode(service),
-        urlencoding::encode(account),
+        urlencoding::encode(name),
         feed.as_path()
     )
 }
@@ -185,14 +198,15 @@ mod tests {
         assert!(html.contains("<strong>SoundCloud: NTS / Likes</strong>"));
         assert!(!html.contains("derek / soundcloud / NTS Profile"));
         assert!(html.contains("RSS"));
+        assert!(!html.contains("Items:"));
     }
 
-    fn configured_feed_path(account: &str, feed: SoundCloudFeedKind) -> String {
+    fn configured_feed_path(name: &str, feed: SoundCloudFeedKind) -> String {
         let config = Config::default();
         let user = &config.users[0];
         let service = config
-            .service(&user.name, crate::config::ServiceKind::Soundcloud, account)
+            .service(&user.name, crate::config::ServiceKind::Soundcloud, name)
             .expect("configured test service");
-        feed_path(&user.name, service.kind.as_path(), &service.account, feed)
+        feed_path(&user.name, service.kind.as_path(), &service.name, feed)
     }
 }
