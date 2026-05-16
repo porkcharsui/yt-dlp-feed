@@ -37,6 +37,7 @@ metadata:
 
 downloads:
   max_concurrent: 3
+  probe_timeout_seconds: 300
 
 auth:
   enabled: false
@@ -91,7 +92,9 @@ Audio downloads prefer the best available M4A/AAC stream, falling back to yt-dlp
 
 No more than `downloads.max_concurrent` media downloads can run at once. The default is `3`. Requests joining an existing in-flight item do not count as new downloads. If the limit is reached for a new item, the server returns `503 Service Unavailable` with `Retry-After: 30`.
 
-Completed cached media supports `HEAD`, `If-Modified-Since`, and byte `Range` requests, including `206 Partial Content` and `416 Range Not Satisfiable`. On a cold cache, requests stream a live fragmented MP4/AAC response as `200 OK` so browsers can begin playback while the download is still running. Seeking and byte-range responses become available after the normal `.m4a` cache file is complete.
+Completed cached media supports `HEAD`, `If-Modified-Since`, and byte `Range` requests, including `206 Partial Content` and `416 Range Not Satisfiable`. On a cold cache, plain `GET` requests stream a live fragmented MP4/AAC response as `200 OK` so browsers can begin playback while the download is still running. Cold `HEAD` and byte `Range` probes start or join the download and wait up to `downloads.probe_timeout_seconds` for the completed cache file, then return normal cached-file headers. If the probe wait times out, the response is `503 Service Unavailable` with `Retry-After: 30`.
+
+This behavior targets private Apple Podcasts app use over a private network or Tailscale URL. Apple expects episode enclosures to support `HEAD` and byte-range requests, and it may probe audio before playback. Pocket Casts is explicitly unsupported for tailnet-only feeds because it performs server-side processing of public feeds; its backend cannot reliably fetch private Tailscale URLs.
 
 If every client disconnects while a download is still in flight, `cache.disconnect_behavior` controls whether the server keeps or cancels the orphaned download:
 
@@ -229,9 +232,10 @@ HTTP is only reachable inside the sidecar network namespace.
 
 `compose.yaml` runs the app behind a Tailscale sidecar. The app shares the
 sidecar network namespace and listens only on `127.0.0.1:8080`; Tailscale Serve
-terminates HTTPS on port 443 and proxies to the app. Tailscale ACLs provide the
-tailnet access control layer, so the app's built-in Basic auth stays disabled in
-the provided container config.
+accepts tailnet HTTP on port 80 and HTTPS on port 443, then proxies both to the
+app's internal port 8080. Tailscale ACLs provide the tailnet access control
+layer, so the app's built-in Basic auth stays disabled in the provided container
+config.
 
 Create the ignored runtime config from the tracked template. For Compose, set
 `server.bind: "127.0.0.1:8080"` so the app only listens inside the shared
@@ -263,7 +267,8 @@ Optional environment variables:
   server logs.
 
 The Serve config lives at `docker/tailscale/serve.json` and uses
-`${TS_CERT_DOMAIN}` so Tailscale fills in the node's HTTPS DNS name. It keeps
-`AllowFunnel` set to `false`, which exposes the service only to your tailnet. Set
-that value to `true` only if you intentionally want public Funnel ingress and
-your tailnet policy allows it.
+`${TS_CERT_DOMAIN}` so Tailscale fills in the node's DNS name. It maps both
+`${TS_CERT_DOMAIN}:80` and `${TS_CERT_DOMAIN}:443` to
+`http://127.0.0.1:8080`. It keeps `AllowFunnel` set to `false`, which exposes
+the service only to your tailnet. Set that value to `true` only if you
+intentionally want public Funnel ingress and your tailnet policy allows it.

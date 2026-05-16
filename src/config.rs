@@ -59,6 +59,7 @@ pub struct MetadataConfig {
 #[serde(default)]
 pub struct DownloadsConfig {
     pub max_concurrent: usize,
+    pub probe_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,7 +184,16 @@ impl MetadataConfig {
 
 impl Default for DownloadsConfig {
     fn default() -> Self {
-        Self { max_concurrent: 3 }
+        Self {
+            max_concurrent: 3,
+            probe_timeout_seconds: 300,
+        }
+    }
+}
+
+impl DownloadsConfig {
+    pub fn probe_timeout(&self) -> Duration {
+        Duration::from_secs(self.probe_timeout_seconds)
     }
 }
 
@@ -238,6 +248,14 @@ impl Config {
                 DownloadsConfig::default().max_concurrent
             );
             self.downloads.max_concurrent = DownloadsConfig::default().max_concurrent;
+        }
+
+        if self.downloads.probe_timeout_seconds == 0 {
+            tracing::warn!(
+                "downloads.probe_timeout_seconds must be greater than 0; using default {}",
+                DownloadsConfig::default().probe_timeout_seconds
+            );
+            self.downloads.probe_timeout_seconds = DownloadsConfig::default().probe_timeout_seconds;
         }
 
         if self.metadata.refresh_interval_hours == Some(0) {
@@ -348,6 +366,7 @@ impl Config {
             metadata_refresh_interval_hours = ?self.metadata.refresh_interval_hours,
             metadata_recent_grace_minutes = self.metadata.refresh_recent_grace_minutes,
             max_concurrent_downloads = self.downloads.max_concurrent,
+            probe_timeout_seconds = self.downloads.probe_timeout_seconds,
             "yt-dlp-feed startup summary"
         );
     }
@@ -422,6 +441,9 @@ mod tests {
         assert_eq!(config.cache.media_ttl(), Some(Duration::from_secs(21_600)));
         assert_eq!(config.cache.media_max_megabytes, Some(10_240));
         assert_eq!(config.cache.media_max_bytes(), Some(10_737_418_240));
+        assert_eq!(config.downloads.max_concurrent, 3);
+        assert_eq!(config.downloads.probe_timeout_seconds, 300);
+        assert_eq!(config.downloads.probe_timeout(), Duration::from_secs(300));
 
         let nts = config
             .service("derek", ServiceKind::Soundcloud, "NTS")
@@ -451,6 +473,9 @@ cache:
   media_max_megabytes: 1024
   disconnect_behavior: "cancel"
   disconnect_grace_seconds: 5
+downloads:
+  max_concurrent: 4
+  probe_timeout_seconds: 42
 auth:
   enabled: true
   username: "derek"
@@ -480,6 +505,9 @@ users:
         assert_eq!(config.cache.media_max_bytes(), Some(1_073_741_824));
         assert_eq!(config.cache.disconnect_behavior, DisconnectBehavior::Cancel);
         assert_eq!(config.cache.disconnect_grace_seconds, 5);
+        assert_eq!(config.downloads.max_concurrent, 4);
+        assert_eq!(config.downloads.probe_timeout_seconds, 42);
+        assert_eq!(config.downloads.probe_timeout(), Duration::from_secs(42));
         assert!(config.auth.enabled);
         assert_eq!(config.auth.username.as_deref(), Some("derek"));
         assert!(config

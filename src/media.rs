@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::Stream;
 use http::StatusCode;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,14 @@ pub struct FeedItem {
     pub id: String,
     pub title: String,
     pub webpage_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
 }
 
 #[async_trait]
@@ -175,6 +184,12 @@ impl MediaBackend for YtDlpBackend {
                 id: entry.id,
                 title: entry.title,
                 webpage_url: entry.url,
+                description: entry
+                    .uploader
+                    .map(|uploader| format!("Uploaded by {uploader}")),
+                published_at: None,
+                content_length: None,
+                thumbnail_url: entry.thumbnail,
             })
             .collect();
 
@@ -757,7 +772,7 @@ struct DownloadLifecycle {
     cancel_tx: watch::Sender<bool>,
 }
 
-struct ClientAttachment {
+pub(crate) struct ClientAttachment {
     lifecycle: Option<Arc<DownloadLifecycle>>,
 }
 
@@ -782,7 +797,7 @@ impl ActiveDownload {
         self.shutdown.clone()
     }
 
-    fn attach_client(&self) -> ClientAttachment {
+    pub(crate) fn attach_client(&self) -> ClientAttachment {
         self.lifecycle.attach_client()
     }
 }
@@ -2141,6 +2156,24 @@ mod tests {
             temp_download_path(Path::new("/tmp/item.m4a")).unwrap(),
             PathBuf::from("/tmp/item.m4a.download.m4a")
         );
+    }
+
+    #[test]
+    fn feed_item_deserializes_without_optional_podcast_fields() {
+        let item: FeedItem = serde_json::from_str(
+            r#"{
+                "id": "track-1",
+                "title": "Track One",
+                "webpage_url": "https://soundcloud.com/example/track-one"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(item.id, "track-1");
+        assert_eq!(item.description, None);
+        assert_eq!(item.published_at, None);
+        assert_eq!(item.content_length, None);
+        assert_eq!(item.thumbnail_url, None);
     }
 
     async fn wait_done(mut rx: watch::Receiver<Option<Result<(), String>>>) -> Result<(), String> {

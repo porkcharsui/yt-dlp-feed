@@ -14,6 +14,7 @@ metadata:
 
 downloads:
   max_concurrent: 3
+  probe_timeout_seconds: 300
 
 auth:
   enabled: false

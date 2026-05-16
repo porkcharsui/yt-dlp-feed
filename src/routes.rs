@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
@@ -226,6 +226,7 @@ async fn render_soundcloud_feed(
     }
 
     let base_url = base_url_from_headers(&headers);
+    let media_lengths = cached_media_lengths(&state, &user, &service, &cached.items).await;
 
     match rss_feed::render_feed(
         &base_url,
@@ -233,6 +234,7 @@ async fn render_soundcloud_feed(
         &service,
         feed,
         &cached.items,
+        &media_lengths,
         cached.last_successful_refresh,
     ) {
         Ok(xml) => {
@@ -294,13 +296,9 @@ async fn download_audio(
         return serve_cached_media(&method, &headers, &path).await;
     }
 
-    if method == Method::HEAD {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
     let active = match state
         .downloads
-        .try_ensure_download(key, item.webpage_url, path.clone())
+        .try_ensure_download(key, item.webpage_url.clone(), path.clone())
         .await
     {
         Ok(active) => active,
@@ -314,6 +312,32 @@ async fn download_audio(
         }
     };
 
+    if method == Method::HEAD || headers.get(header::RANGE).is_some() {
+        tracing::info!(
+            %user,
+            service = %service.kind.as_path(),
+            name = %name,
+            item_id = %item.id,
+            method = %method,
+            has_range = headers.get(header::RANGE).is_some(),
+            timeout_seconds = state.config.downloads.probe_timeout_seconds,
+            "cold media probe waiting for cache"
+        );
+        return match wait_for_active_download(active, state.config.downloads.probe_timeout()).await
+        {
+            Ok(()) => serve_cached_media(&method, &headers, &path).await,
+            Err(ProbeWaitError::Download(message)) => {
+                (StatusCode::BAD_GATEWAY, message).into_response()
+            }
+            Err(ProbeWaitError::Timeout) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "30")],
+                "media download is still caching",
+            )
+                .into_response(),
+        };
+    }
+
     let stream = stream_download(active);
     let body = Body::from_stream(stream);
 
@@ -322,6 +346,57 @@ async fn download_audio(
         .header(header::CONTENT_TYPE, "audio/mp4")
         .body(body)
         .expect("valid audio stream response")
+}
+
+async fn cached_media_lengths(
+    state: &AppState,
+    user: &str,
+    service: &crate::config::ServiceConfig,
+    items: &[FeedItem],
+) -> HashMap<String, u64> {
+    let mut lengths = HashMap::new();
+    let ttl = state.config.cache.media_ttl();
+    for item in items {
+        let key = cache_key(user, service.kind.as_path(), &service.name, &item.id);
+        let path = media_path(&state.config, &key);
+        if !is_fresh(&path, ttl).await {
+            continue;
+        }
+        if let Ok(metadata) = tokio::fs::metadata(&path).await {
+            lengths.insert(item.id.clone(), metadata.len());
+        }
+    }
+    lengths
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeWaitError {
+    Download(String),
+    Timeout,
+}
+
+async fn wait_for_active_download(
+    active: crate::media::ActiveDownload,
+    timeout: Duration,
+) -> Result<(), ProbeWaitError> {
+    let _client = active.attach_client();
+    let mut completion = active.completion();
+    let wait = async {
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result.map_err(ProbeWaitError::Download);
+            }
+            if completion.changed().await.is_err() {
+                return Err(ProbeWaitError::Download(
+                    "media download ended before reporting completion".to_string(),
+                ));
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, wait)
+        .await
+        .unwrap_or(Err(ProbeWaitError::Timeout))
 }
 
 async fn find_item(
@@ -499,6 +574,10 @@ mod tests {
 
     struct MockBackend;
 
+    struct HangingBackend {
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
     #[async_trait]
     impl MediaBackend for MockBackend {
         async fn fetch_feed(
@@ -511,11 +590,19 @@ mod tests {
                     id: "track-2".to_string(),
                     title: "Track Two".to_string(),
                     webpage_url: "https://soundcloud.com/dereknet/track-two".to_string(),
+                    description: Some("Uploaded by Example Artist".to_string()),
+                    published_at: None,
+                    content_length: None,
+                    thumbnail_url: Some("https://example.test/art-2.jpg".to_string()),
                 },
                 FeedItem {
                     id: "track-1".to_string(),
                     title: "Track One".to_string(),
                     webpage_url: "https://soundcloud.com/dereknet/track-one".to_string(),
+                    description: Some("Uploaded by Example Artist".to_string()),
+                    published_at: None,
+                    content_length: None,
+                    thumbnail_url: Some("https://example.test/art-1.jpg".to_string()),
                 },
             ])
         }
@@ -537,6 +624,48 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"audio"),
             });
             tokio::fs::rename(temp_path, output_path).await?;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl MediaBackend for HangingBackend {
+        async fn fetch_feed(
+            &self,
+            _source_url: &str,
+            _feed: SoundCloudFeedKind,
+        ) -> anyhow::Result<Vec<FeedItem>> {
+            Ok(vec![])
+        }
+
+        async fn download_audio(
+            &self,
+            _source_url: &str,
+            output_path: &FsPath,
+            _chunks: tokio::sync::broadcast::Sender<DownloadChunk>,
+            mut shutdown: tokio::sync::watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let mut release = self.release.clone();
+            tokio::select! {
+                _ = async {
+                    while !*release.borrow() {
+                        if release.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                } => {},
+                _ = async {
+                    while !*shutdown.borrow() {
+                        if shutdown.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                } => return Err(anyhow::anyhow!("mock download cancelled")),
+            }
+            if let Some(parent) = output_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(output_path, b"audio").await?;
             Ok(())
         }
     }
@@ -602,9 +731,66 @@ mod tests {
         assert!(xml.contains("Track One"));
         assert!(xml.contains(&configured_media_url("dereknet", "track-1")));
         assert!(xml.contains("audio/mp4"));
-        assert!(!xml.contains("media:thumbnail"));
-        assert!(!xml.contains("itunes:image"));
+        assert!(xml.contains("length=\"0\""));
+        assert!(xml.contains("Uploaded by Example Artist"));
+        assert!(xml.contains("media:thumbnail"));
+        assert!(xml.contains("itunes:image"));
         assert!(xml.find("Track Two").unwrap() < xml.find("Track One").unwrap());
+    }
+
+    #[tokio::test]
+    async fn rss_enclosure_uses_cached_media_length_when_available() {
+        let mut config = Config::default();
+        let dir = tempdir().unwrap();
+        config.cache.data_dir = dir.path().to_path_buf();
+        let coordinator = Arc::new(DownloadCoordinator::from_arc(Arc::new(MockBackend)));
+        let metadata = Arc::new(MetadataCache::new(config.clone()).await.unwrap());
+        let user = &config.users[0];
+        let service = config
+            .service(&user.name, ServiceKind::Soundcloud, "dereknet")
+            .unwrap();
+        let items = coordinator
+            .fetch_feed(
+                &SoundCloudFeedKind::Profile.source_url(service),
+                SoundCloudFeedKind::Profile,
+            )
+            .await
+            .unwrap();
+        let key = cache_key(&user.name, "soundcloud", &service.name, "track-1");
+        let path = media_path(&config, &key);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, b"cached-audio").await.unwrap();
+        metadata
+            .store_success_for_test(
+                identity_for(&user.name, service, SoundCloudFeedKind::Profile),
+                service,
+                items,
+            )
+            .await
+            .unwrap();
+        let app = router(AppState::new(config, coordinator, metadata));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(configured_feed_path(
+                        "dereknet",
+                        SoundCloudFeedKind::Profile,
+                    ))
+                    .header(header::HOST, "example.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(xml.contains("track-1/audio.m4a\" length=\"12\" type=\"audio/mp4\""));
     }
 
     #[tokio::test]
@@ -696,7 +882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_media_range_request_streams_active_download() {
+    async fn cold_media_range_request_waits_for_cache_and_serves_partial_content() {
         let app = test_router().await;
 
         let response = app
@@ -710,14 +896,95 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
-        assert!(response.headers().get(header::CONTENT_RANGE).is_none());
-        assert!(response.headers().get(header::ACCEPT_RANGES).is_none());
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "5");
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-4/5"
+        );
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(&body[..], b"audio");
+    }
+
+    #[tokio::test]
+    async fn cold_media_head_waits_for_cache_and_serves_headers() {
+        let app = test_router().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(configured_media_url("dereknet", "track-1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "5");
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cold_media_probe_timeout_returns_retry_after() {
+        let mut config = Config::default();
+        config.downloads.probe_timeout_seconds = 1;
+        let dir = tempdir().unwrap();
+        config.cache.data_dir = dir.keep();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let backend = Arc::new(HangingBackend {
+            release: release_rx,
+        });
+        let coordinator = Arc::new(DownloadCoordinator::from_arc(backend));
+        let metadata = Arc::new(MetadataCache::new(config.clone()).await.unwrap());
+        let service = config
+            .service("derek", ServiceKind::Soundcloud, "dereknet")
+            .unwrap();
+        metadata
+            .store_success_for_test(
+                identity_for("derek", service, SoundCloudFeedKind::Profile),
+                service,
+                vec![FeedItem {
+                    id: "track-1".to_string(),
+                    title: "Track One".to_string(),
+                    webpage_url: "https://soundcloud.com/dereknet/track-one".to_string(),
+                    description: None,
+                    published_at: None,
+                    content_length: None,
+                    thumbnail_url: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let app = router(AppState::new(config, coordinator, metadata));
+
+        let request = app.oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri(configured_media_url("dereknet", "track-1"))
+                .body(Body::empty())
+                .unwrap(),
+        );
+        tokio::pin!(request);
+        let response = request.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "30");
+        let _ = release_tx.send(true);
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use rss::extension::itunes::ITunesItemExtension;
 use rss::extension::{Extension, ExtensionMap};
 use rss::{ChannelBuilder, EnclosureBuilder, GuidBuilder, ItemBuilder};
 
@@ -14,6 +16,7 @@ pub fn render_feed(
     service: &ServiceConfig,
     feed: SoundCloudFeedKind,
     items: &[FeedItem],
+    media_lengths: &HashMap<String, u64>,
     last_successful_refresh: DateTime<Utc>,
 ) -> anyhow::Result<String> {
     let feed_path = crate::html::feed_path(user, service.kind.as_path(), &service.name, feed);
@@ -39,12 +42,30 @@ pub fn render_feed(
             let enclosure = EnclosureBuilder::default()
                 .url(media_url)
                 .mime_type("audio/mp4".to_string())
-                .length("0".to_string())
+                .length(
+                    media_lengths
+                        .get(&item.id)
+                        .copied()
+                        .or(item.content_length)
+                        .unwrap_or(0)
+                        .to_string(),
+                )
                 .build();
 
-            ItemBuilder::default()
+            let mut builder = ItemBuilder::default();
+            if let Some(thumbnail_url) = &item.thumbnail_url {
+                builder.extensions(item_artwork_extensions(thumbnail_url));
+                builder.itunes_ext(ITunesItemExtension {
+                    image: Some(thumbnail_url.clone()),
+                    ..ITunesItemExtension::default()
+                });
+            }
+
+            builder
                 .title(Some(item.title.clone()))
                 .link(Some(item.webpage_url.clone()))
+                .description(item.description.clone())
+                .pub_date(item.published_at.map(rfc2822))
                 .guid(Some(
                     GuidBuilder::default()
                         .value(item.id.clone())
@@ -86,6 +107,22 @@ fn channel_extensions(channel_link: &str) -> ExtensionMap {
         .or_default()
         .push(Extension {
             name: "atom:link".to_string(),
+            attrs,
+            ..Extension::default()
+        });
+    map
+}
+
+fn item_artwork_extensions(thumbnail_url: &str) -> ExtensionMap {
+    let mut map = ExtensionMap::new();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("url".to_string(), thumbnail_url.to_string());
+    map.entry("media".to_string())
+        .or_default()
+        .entry("thumbnail".to_string())
+        .or_default()
+        .push(Extension {
+            name: "media:thumbnail".to_string(),
             attrs,
             ..Extension::default()
         });
