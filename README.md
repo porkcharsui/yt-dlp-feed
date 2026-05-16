@@ -10,7 +10,7 @@ This repository contains the first Rust implementation scaffold: config loading,
 
 ## Supported Services
 
-The server is designed around yt-dlp-compatible sources. V1 implements SoundCloud profile feeds; other services can be added later by teaching the app how to fetch their feed metadata and download their media.
+The server is designed around yt-dlp-compatible sources. V1 implements SoundCloud profile and likes feeds; other services can be added later by teaching the app how to fetch their feed metadata and download their media.
 
 For the broader list of services that yt-dlp may support, see the canonical yt-dlp documentation:
 
@@ -18,7 +18,7 @@ For the broader list of services that yt-dlp may support, see the canonical yt-d
 
 ## Configuration
 
-By default, the server looks for `config.yaml`. If no config exists, it uses built-in example SoundCloud defaults. You can also pass a path with `--config` or `YT_DLP_FEED_CONFIG`.
+By default, the server looks for `config.yaml`. If no config exists, it uses built-in example SoundCloud defaults. You can also pass a path with `--config` or `YT_DLP_FEED_CONFIG`, and override `cache.data_dir` with `--data-dir` or `YT_DLP_FEED_DATA_DIR`.
 
 ```yaml
 server:
@@ -79,7 +79,7 @@ Append `?refresh=1` to an RSS feed URL to manually refresh that feed. Manual ref
 
 Metadata refreshes are atomic: the old cache remains in service until a new fetch succeeds and the JSON file is written with a temp-file-then-rename swap. If SoundCloud or yt-dlp fails and cached metadata exists, RSS continues to render from the last successful metadata. Last refresh errors are kept in memory for `index.json` and logs, not persisted to metadata cache files.
 
-RSS responses set `Last-Modified` and `<lastBuildDate>` from the metadata cache's last successful refresh timestamp. Normal feed requests honor `If-Modified-Since` and may return `304 Not Modified`; explicit `?refresh=1` requests always evaluate the refresh path. Track artwork is emitted as both `media:thumbnail` and `itunes:image` using the original source thumbnail URL. Image bytes are not downloaded, proxied, or cached by this app.
+RSS responses set `Last-Modified` and `<lastBuildDate>` from the metadata cache's last successful refresh timestamp. Normal feed requests honor `If-Modified-Since` and may return `304 Not Modified`; explicit `?refresh=1` requests always evaluate the refresh path.
 
 `GET /index.json` includes `generated_at`, a summary, and one entry per configured feed with metadata cache state: `missing`, `warming`, `ready`, `refreshing`, `stale`, or `error`. The HTML index keeps things simple: RSS links, quiet per-feed refresh links, state, and `Last fetched (UTC)` timestamps.
 
@@ -87,11 +87,11 @@ RSS responses set `Last-Modified` and `<lastBuildDate>` from the metadata cache'
 
 ## Download Behavior
 
-Audio downloads prefer the best available AAC stream and serve `audio/mp4` from `.m4a` URLs. If cached media exists and is still inside `media_ttl_minutes`, the server serves it directly. If `media_ttl_minutes` is `null`, existing cached media is considered reusable until another cleanup limit removes it. Otherwise, the first client request starts a new download, and concurrent requests for the same item share the same in-flight job.
+Audio downloads prefer the best available M4A/AAC stream, falling back to yt-dlp's best available audio format when M4A is unavailable. yt-dlp fetches the source audio and ffmpeg transcodes the streamed bytes to AAC in an MP4/M4A container, so the app serves cached media consistently from `.m4a` URLs. If cached media exists and is still inside `media_ttl_minutes`, the server serves it directly. If `media_ttl_minutes` is `null`, existing cached media is considered reusable until another cleanup limit removes it. Otherwise, the first client request starts a new download, and concurrent requests for the same item share the same in-flight job.
 
 No more than `downloads.max_concurrent` media downloads can run at once. The default is `3`. Requests joining an existing in-flight item do not count as new downloads. If the limit is reached for a new item, the server returns `503 Service Unavailable` with `Retry-After: 30`.
 
-Completed cached media supports `HEAD`, `If-Modified-Since`, and byte `Range` requests, including `206 Partial Content` and `416 Range Not Satisfiable`. Initial just-in-time downloads still stream as regular `200 OK` responses without range support.
+Completed cached media supports `HEAD`, `If-Modified-Since`, and byte `Range` requests, including `206 Partial Content` and `416 Range Not Satisfiable`. On a cold cache, requests stream a live fragmented MP4/AAC response as `200 OK` so browsers can begin playback while the download is still running. Seeking and byte-range responses become available after the normal `.m4a` cache file is complete.
 
 If every client disconnects while a download is still in flight, `cache.disconnect_behavior` controls whether the server keeps or cancels the orphaned download:
 
@@ -180,20 +180,50 @@ Normal tests should mock the yt-dlp boundary. Live SoundCloud tests should be op
 
 ## Docker
 
-Build and run the server locally:
+Build the image:
 
 ```sh
 docker build -t yt-dlp-feed .
-docker run --rm -p 8080:8080 \
-  -v "$PWD/docker/config.local.yaml:/config/config.yaml:ro" \
-  -v yt-dlp-feed-data:/data \
-  yt-dlp-feed --config /config/config.yaml
 ```
 
-The image includes `yt-dlp` and `ffmpeg`. The local-run config binds
-`0.0.0.0:8080`; the Tailscale Compose config binds `127.0.0.1:8080` so raw HTTP
-is only reachable inside the sidecar network namespace. Both configs use `/data`
-for the media and metadata cache.
+The image installs `yt-dlp` from PyPI at build time so it gets the current
+upstream extractor code instead of the older Debian package. To force Docker to
+fetch a fresh `yt-dlp` version, rebuild without cache:
+
+```sh
+docker build --no-cache -t yt-dlp-feed .
+```
+
+Run the container with the tracked example config, a persistent Docker volume for
+media and metadata, and debug logging enabled:
+
+```sh
+docker run --rm \
+  -p 8080:8080 \
+  -v "$PWD/config.example.yaml:/config/config.yaml:ro" \
+  -v yt-dlp-feed-data:/data \
+  yt-dlp-feed --config /config/config.yaml --data-dir /data --debug
+```
+
+The image includes the latest build-time `yt-dlp` and Debian `ffmpeg`.
+`--data-dir /data` overrides `cache.data_dir` from the mounted config so cache
+files land on the `yt-dlp-feed-data` Docker volume.
+
+For personal feed lists or secrets, copy the example to the ignored root
+`config.yaml`, edit it, and mount that file instead:
+
+```sh
+cp config.example.yaml config.yaml
+docker run --rm \
+  -p 8080:8080 \
+  -v "$PWD/config.yaml:/config/config.yaml:ro" \
+  -v yt-dlp-feed-data:/data \
+  yt-dlp-feed --config /config/config.yaml --data-dir /data --debug
+```
+
+Plain `docker run -p 8080:8080` requires `server.bind: "0.0.0.0:8080"` in the
+mounted config. The Tailscale Compose setup should use `127.0.0.1:8080` so raw
+HTTP is only reachable inside the sidecar network namespace.
 
 ## Docker Compose With Tailscale
 
@@ -203,12 +233,26 @@ terminates HTTPS on port 443 and proxies to the app. Tailscale ACLs provide the
 tailnet access control layer, so the app's built-in Basic auth stays disabled in
 the provided container config.
 
+Create the ignored runtime config from the tracked template. For Compose, set
+`server.bind: "127.0.0.1:8080"` so the app only listens inside the shared
+Tailscale network namespace:
+
+```sh
+cp config.example.yaml config.yaml
+```
+
+Then edit `config.yaml` for your private feed list and Compose bind address.
+
 Create a reusable or ephemeral auth key in Tailscale, then start the stack:
 
 ```sh
 export TS_AUTHKEY="tskey-auth-..."
 docker compose up -d --build
 ```
+
+Compose mounts the ignored root `config.yaml` into the app container at
+`/config/config.yaml` and passes `--data-dir /data` so media and metadata live
+on the Docker volume.
 
 Optional environment variables:
 

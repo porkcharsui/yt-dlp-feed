@@ -1,5 +1,5 @@
 server:
-  bind: "127.0.0.1:8080"
+  bind: "0.0.0.0:8080"
 
 cache:
   data_dir: "./data"
@@ -26,14 +26,14 @@ users:
         profile_url: "https://soundcloud.com/dereknet"
         feeds:
           - profile
-          - likes 
+          - likes
       - kind: "soundcloud"
         name: "NTS"
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
       - kind: "soundcloud"
-        name: "FourTet"
+        name: "Four Tet"
         profile_url: "https://soundcloud.com/four-tet"
         feeds:
           - profile
@@ -42,5 +42,3 @@ users:
         profile_url: "https://soundcloud.com/caribouband"
         feeds:
           - profile
-
-

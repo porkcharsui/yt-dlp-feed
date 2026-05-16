@@ -313,6 +313,7 @@ async fn download_audio(
                 .into_response()
         }
     };
+
     let stream = stream_download(active);
     let body = Body::from_stream(stream);
 
@@ -510,19 +511,11 @@ mod tests {
                     id: "track-2".to_string(),
                     title: "Track Two".to_string(),
                     webpage_url: "https://soundcloud.com/dereknet/track-two".to_string(),
-                    description: Some("Second in source order".to_string()),
-                    published_at: None,
-                    content_length: Some(12),
-                    thumbnail_url: Some("https://example.test/art-2.jpg".to_string()),
                 },
                 FeedItem {
                     id: "track-1".to_string(),
                     title: "Track One".to_string(),
                     webpage_url: "https://soundcloud.com/dereknet/track-one".to_string(),
-                    description: Some("First in title, second in source order".to_string()),
-                    published_at: None,
-                    content_length: Some(12),
-                    thumbnail_url: Some("https://example.test/art-1.jpg".to_string()),
                 },
             ])
         }
@@ -534,6 +527,9 @@ mod tests {
             chunks: tokio::sync::broadcast::Sender<DownloadChunk>,
             _shutdown: tokio::sync::watch::Receiver<bool>,
         ) -> anyhow::Result<()> {
+            if let Some(parent) = output_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
             let temp_path = output_path.with_file_name("test.download.m4a");
             tokio::fs::write(&temp_path, b"audio").await?;
             let _ = chunks.send(DownloadChunk {
@@ -606,8 +602,8 @@ mod tests {
         assert!(xml.contains("Track One"));
         assert!(xml.contains(&configured_media_url("dereknet", "track-1")));
         assert!(xml.contains("audio/mp4"));
-        assert!(xml.contains("media:thumbnail"));
-        assert!(xml.contains("itunes:image"));
+        assert!(!xml.contains("media:thumbnail"));
+        assert!(!xml.contains("itunes:image"));
         assert!(xml.find("Track Two").unwrap() < xml.find("Track One").unwrap());
     }
 
@@ -697,6 +693,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"cde");
+    }
+
+    #[tokio::test]
+    async fn cold_media_range_request_streams_active_download() {
+        let app = test_router().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(configured_media_url("dereknet", "track-1"))
+                    .header(header::RANGE, "bytes=0-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert!(response.headers().get(header::CONTENT_RANGE).is_none());
+        assert!(response.headers().get(header::ACCEPT_RANGES).is_none());
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"audio");
     }
 
     #[tokio::test]

@@ -25,8 +25,13 @@ RUN apt-get update \
         curl \
         ffmpeg \
         libssl3 \
-        yt-dlp \
+        python3 \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/yt-dlp \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir --upgrade pip yt-dlp \
+    && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp
 
 RUN useradd --create-home --home-dir /var/lib/yt-dlp-feed --shell /usr/sbin/nologin yt-dlp-feed \
     && mkdir -p /config /data \

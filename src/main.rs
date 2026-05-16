@@ -22,6 +22,9 @@ struct Args {
     #[arg(short, long, env = "YT_DLP_FEED_CONFIG", default_value = "config.yaml")]
     config: PathBuf,
 
+    #[arg(long, env = "YT_DLP_FEED_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
     #[arg(long, env = "YT_DLP_FEED_DEBUG", action = ArgAction::SetTrue)]
     debug: bool,
 }
@@ -37,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::load_or_default(&args.config)
         .await
         .with_context(|| format!("failed to load config from {}", args.config.display()))?;
+    if let Some(data_dir) = args.data_dir {
+        config.cache.data_dir = data_dir;
+    }
     config.lint_and_repair();
     config.log_startup_summary();
     config.ensure_directories().await?;

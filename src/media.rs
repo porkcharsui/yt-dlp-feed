@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures_util::Stream;
 use http::StatusCode;
 use sha2::{Digest, Sha256};
@@ -25,10 +24,6 @@ pub struct FeedItem {
     pub id: String,
     pub title: String,
     pub webpage_url: String,
-    pub description: Option<String>,
-    pub published_at: Option<DateTime<Utc>>,
-    pub content_length: Option<u64>,
-    pub thumbnail_url: Option<String>,
 }
 
 #[async_trait]
@@ -180,12 +175,6 @@ impl MediaBackend for YtDlpBackend {
                 id: entry.id,
                 title: entry.title,
                 webpage_url: entry.url,
-                description: entry
-                    .uploader
-                    .map(|uploader| format!("Uploaded by {uploader}")),
-                published_at: None,
-                content_length: None,
-                thumbnail_url: entry.thumbnail,
             })
             .collect();
 
@@ -214,58 +203,158 @@ impl MediaBackend for YtDlpBackend {
         fs::create_dir_all(parent).await?;
         remove_stale_file(output_path).await?;
         let temp_path = temp_download_path(output_path)?;
+        let stream_path = temp_stream_path(output_path)?;
         remove_stale_file(&temp_path).await?;
+        remove_stale_file(&stream_path).await?;
 
         tracing::debug!(
             %source_url,
             output_path = %output_path.display(),
             temp_path = %temp_path.display(),
+            stream_path = %stream_path.display(),
             yt_dlp = %self.ytdlp_path.display(),
             ffmpeg = %self.ffmpeg_path.display(),
-            "yt-dlp passthrough audio download starting"
+            "yt-dlp audio download and ffmpeg transcode starting"
         );
         let started = Instant::now();
         let progress_logging = tracing::enabled!(tracing::Level::DEBUG);
-        let mut child = Command::new(&self.ytdlp_path)
-            .args(ytdlp_download_args(
-                &self.ffmpeg_path,
-                "-",
-                source_url,
-                progress_logging,
-            ))
+        let mut ytdlp_child = Command::new(&self.ytdlp_path)
+            .args(ytdlp_download_args("-", source_url, progress_logging))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to execute yt-dlp for {source_url}"))?;
 
-        let stdout = child
+        let ytdlp_stdout = ytdlp_child
             .stdout
             .take()
             .context("yt-dlp stdout was not captured")?;
-        let stderr = child
+        let ytdlp_stderr = ytdlp_child
             .stderr
             .take()
             .context("yt-dlp stderr was not captured")?;
 
-        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
-        let stderr_task = tokio::spawn(log_ytdlp_stderr(
-            source_url.to_string(),
-            Arc::clone(&stderr_tail),
-            stderr,
-        ));
+        let ffmpeg_output = temp_path.clone();
+        let mut ffmpeg_child = Command::new(&self.ffmpeg_path)
+            .args(ffmpeg_transcode_args(&ffmpeg_output))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to execute ffmpeg for {source_url}"))?;
 
-        let mut cache_file = File::create(&temp_path)
-            .await
-            .with_context(|| format!("failed to create {}", temp_path.display()))?;
-        let mut stdout = stdout;
-        let mut offset = 0;
-        let mut buffer = vec![0; 64 * 1024];
+        let mut ffmpeg_stdin = ffmpeg_child
+            .stdin
+            .take()
+            .context("ffmpeg stdin was not captured")?;
+        let ffmpeg_stderr = ffmpeg_child
+            .stderr
+            .take()
+            .context("ffmpeg stderr was not captured")?;
+        let ffmpeg_stdout = ffmpeg_child
+            .stdout
+            .take()
+            .context("ffmpeg stdout was not captured")?;
+
+        let ytdlp_stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let ytdlp_stderr_task = tokio::spawn(log_tool_stderr(
+            "yt-dlp",
+            source_url.to_string(),
+            Arc::clone(&ytdlp_stderr_tail),
+            ytdlp_stderr,
+        ));
+        let ffmpeg_stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let ffmpeg_stderr_task = tokio::spawn(log_tool_stderr(
+            "ffmpeg",
+            source_url.to_string(),
+            Arc::clone(&ffmpeg_stderr_tail),
+            ffmpeg_stderr,
+        ));
+        let pipe_task = tokio::spawn(async move {
+            let mut ytdlp_stdout = ytdlp_stdout;
+            let result = tokio::io::copy(&mut ytdlp_stdout, &mut ffmpeg_stdin).await;
+            let _ = ffmpeg_stdin.shutdown().await;
+            result
+        });
+        let stream_task = tokio::spawn(write_live_stream(
+            stream_path.clone(),
+            chunks,
+            ffmpeg_stdout,
+        ));
+        let mut pipe_task = Some(pipe_task);
+        let mut stream_task = Some(stream_task);
+        let mut ytdlp_stderr_task = Some(ytdlp_stderr_task);
+        let mut ffmpeg_stderr_task = Some(ffmpeg_stderr_task);
+
         let mut cancelled = false;
 
         loop {
-            let read = tokio::select! {
-                read = stdout.read(&mut buffer) => {
-                    read.with_context(|| format!("failed to read yt-dlp stdout for {source_url}"))?
+            tokio::select! {
+                status = ffmpeg_child.wait() => {
+                    let ffmpeg_status = status
+                        .with_context(|| format!("failed to wait for ffmpeg for {source_url}"))?;
+                    let ytdlp_status = ytdlp_child
+                        .wait()
+                        .await
+                        .with_context(|| format!("failed to wait for yt-dlp for {source_url}"))?;
+                    let pipe_result = pipe_task
+                        .take()
+                        .context("yt-dlp to ffmpeg pipe task was missing")?
+                        .await;
+                    let stream_result = stream_task
+                        .take()
+                        .context("ffmpeg live stream task was missing")?
+                        .await;
+                    if let Some(task) = ytdlp_stderr_task.take() {
+                        let _ = task.await;
+                    }
+                    if let Some(task) = ffmpeg_stderr_task.take() {
+                        let _ = task.await;
+                    }
+
+                    if !ytdlp_status.success() {
+                        let stderr = ytdlp_stderr_tail.lock().await.join("\n");
+                        tracing::debug!(
+                            %source_url,
+                            output_path = %output_path.display(),
+                            temp_path = %temp_path.display(),
+                            elapsed_ms = started.elapsed().as_millis(),
+                            status = ?ytdlp_status.code(),
+                            stderr = %stderr,
+                            "yt-dlp audio download failed"
+                        );
+                        remove_stale_file(&temp_path).await?;
+                        remove_stale_file(&stream_path).await?;
+                        return Err(anyhow::anyhow!(
+                            "yt-dlp failed for {source_url}: {}",
+                            stderr.trim()
+                        ));
+                    }
+
+                    if !ffmpeg_status.success() {
+                        let stderr = ffmpeg_stderr_tail.lock().await.join("\n");
+                        tracing::debug!(
+                            %source_url,
+                            output_path = %output_path.display(),
+                            temp_path = %temp_path.display(),
+                            elapsed_ms = started.elapsed().as_millis(),
+                            status = ?ffmpeg_status.code(),
+                            stderr = %stderr,
+                            "ffmpeg audio transcode failed"
+                        );
+                        remove_stale_file(&temp_path).await?;
+                        remove_stale_file(&stream_path).await?;
+                        return Err(anyhow::anyhow!(
+                            "ffmpeg failed for {source_url}: {}",
+                            stderr.trim()
+                        ));
+                    }
+
+                    let pipe_result = pipe_result.context("yt-dlp to ffmpeg pipe task failed")?;
+                    pipe_result.with_context(|| format!("failed to pipe yt-dlp output for {source_url}"))?;
+                    let stream_result = stream_result.context("ffmpeg live stream task failed")?;
+                    stream_result.with_context(|| format!("failed to stream ffmpeg output for {source_url}"))?;
+                    break;
                 },
                 _ = wait_for_shutdown(&mut shutdown) => {
                     cancelled = true;
@@ -273,66 +362,40 @@ impl MediaBackend for YtDlpBackend {
                         %source_url,
                         output_path = %output_path.display(),
                         temp_path = %temp_path.display(),
-                        "yt-dlp passthrough audio download cancelling for shutdown"
+                        "audio download and transcode cancelling for shutdown"
                     );
-                    let _ = child.start_kill();
+                    let _ = ytdlp_child.start_kill();
+                    let _ = ffmpeg_child.start_kill();
                     break;
                 },
             };
-            if read == 0 {
-                break;
-            }
-
-            cache_file
-                .write_all(&buffer[..read])
-                .await
-                .with_context(|| format!("failed to write {}", temp_path.display()))?;
-            let bytes = Bytes::copy_from_slice(&buffer[..read]);
-            let _ = chunks.send(DownloadChunk { offset, bytes });
-            offset += read as u64;
         }
-
-        cache_file
-            .flush()
-            .await
-            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-        drop(cache_file);
-
-        let status = child
-            .wait()
-            .await
-            .with_context(|| format!("failed to wait for yt-dlp for {source_url}"))?;
-        let _ = stderr_task.await;
 
         if cancelled {
+            let _ = ytdlp_child.wait().await;
+            let _ = ffmpeg_child.wait().await;
+            if let Some(task) = pipe_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = stream_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = ytdlp_stderr_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = ffmpeg_stderr_task.take() {
+                let _ = task.await;
+            }
             tracing::debug!(
                 %source_url,
                 output_path = %output_path.display(),
                 temp_path = %temp_path.display(),
                 elapsed_ms = started.elapsed().as_millis(),
-                status = ?status.code(),
-                "yt-dlp passthrough audio download cancelled for shutdown"
+                "audio download and transcode cancelled for shutdown"
             );
             remove_stale_file(&temp_path).await?;
+            remove_stale_file(&stream_path).await?;
             return Err(anyhow::anyhow!("yt-dlp cancelled during shutdown"));
-        }
-
-        if !status.success() {
-            let stderr = stderr_tail.lock().await.join("\n");
-            tracing::debug!(
-                %source_url,
-                output_path = %output_path.display(),
-                temp_path = %temp_path.display(),
-                elapsed_ms = started.elapsed().as_millis(),
-                status = ?status.code(),
-                stderr = %stderr,
-                "yt-dlp passthrough audio download failed"
-            );
-            remove_stale_file(&temp_path).await?;
-            return Err(anyhow::anyhow!(
-                "yt-dlp failed for {source_url}: {}",
-                stderr.trim()
-            ));
         }
 
         fs::rename(&temp_path, output_path).await.with_context(|| {
@@ -346,12 +409,12 @@ impl MediaBackend for YtDlpBackend {
             .await
             .ok()
             .map(|metadata| metadata.len());
-        tracing::debug!(
+        tracing::info!(
             %source_url,
             output_path = %output_path.display(),
             elapsed_ms = started.elapsed().as_millis(),
             bytes = downloaded_bytes,
-            "yt-dlp passthrough audio download completed"
+            "media file download completed"
         );
 
         Ok(())
@@ -364,6 +427,14 @@ fn temp_download_path(output_path: &Path) -> anyhow::Result<PathBuf> {
         .and_then(|name| name.to_str())
         .context("download path has no valid file name")?;
     Ok(output_path.with_file_name(format!("{file_name}.download.m4a")))
+}
+
+fn temp_stream_path(output_path: &Path) -> anyhow::Result<PathBuf> {
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("download path has no valid file name")?;
+    Ok(output_path.with_file_name(format!("{file_name}.stream.mp4")))
 }
 
 async fn remove_stale_file(path: &Path) -> anyhow::Result<()> {
@@ -400,7 +471,6 @@ fn is_soundcloud_playlist_item_url(url: &str) -> bool {
 }
 
 fn ytdlp_download_args(
-    ffmpeg_path: &Path,
     output_template: &str,
     source_url: &str,
     progress_logging: bool,
@@ -410,10 +480,8 @@ fn ytdlp_download_args(
         "--playlist-items".to_string(),
         "1".to_string(),
         "--no-part".to_string(),
-        "--ffmpeg-location".to_string(),
-        ffmpeg_path.display().to_string(),
         "-f".to_string(),
-        "bestaudio[ext=m4a]".to_string(),
+        "bestaudio[ext=m4a]/bestaudio/best".to_string(),
         "-o".to_string(),
         output_template.to_string(),
     ];
@@ -422,8 +490,6 @@ fn ytdlp_download_args(
         args.extend([
             "--newline".to_string(),
             "--progress".to_string(),
-            "--progress-delta".to_string(),
-            "1".to_string(),
             "--progress-template".to_string(),
             "download:yt-dlp-rss-progress|%(progress.status|)s|%(progress.downloaded_bytes|)s|%(progress.total_bytes|)s|%(progress.total_bytes_estimate|)s|%(progress.speed|)s|%(progress.eta|)s".to_string(),
         ]);
@@ -433,6 +499,71 @@ fn ytdlp_download_args(
 
     args.push(source_url.to_string());
     args
+}
+
+fn ffmpeg_transcode_args(output_path: &Path) -> Vec<String> {
+    vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
+        "-i".to_string(),
+        "pipe:0".to_string(),
+        "-vn".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "160k".to_string(),
+        "-movflags".to_string(),
+        "empty_moov+default_base_moof+frag_custom".to_string(),
+        "-frag_duration".to_string(),
+        "1000000".to_string(),
+        "-f".to_string(),
+        "mp4".to_string(),
+        "pipe:1".to_string(),
+        "-vn".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "160k".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        output_path.display().to_string(),
+    ]
+}
+
+async fn write_live_stream(
+    path: PathBuf,
+    chunks: broadcast::Sender<DownloadChunk>,
+    mut stdout: tokio::process::ChildStdout,
+) -> anyhow::Result<()> {
+    let mut file = File::create(&path)
+        .await
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut offset = 0;
+    let mut buffer = vec![0; 64 * 1024];
+
+    loop {
+        let read = stdout
+            .read(&mut buffer)
+            .await
+            .context("failed to read ffmpeg stdout")?;
+        if read == 0 {
+            break;
+        }
+
+        file.write_all(&buffer[..read])
+            .await
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes = Bytes::copy_from_slice(&buffer[..read]);
+        let _ = chunks.send(DownloadChunk { offset, bytes });
+        offset += read as u64;
+    }
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -555,7 +686,8 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
-async fn log_ytdlp_stderr(
+async fn log_tool_stderr(
+    tool: &'static str,
     source_url: String,
     tail: Arc<Mutex<Vec<String>>>,
     stderr: tokio::process::ChildStderr,
@@ -586,7 +718,7 @@ async fn log_ytdlp_stderr(
                 "yt-dlp download progress"
             );
         } else {
-            tracing::debug!(%source_url, line = %line, "yt-dlp stderr");
+            tracing::debug!(%source_url, tool, line = %line, "tool stderr");
         }
     }
 }
@@ -606,6 +738,7 @@ pub struct DownloadLimitError;
 #[derive(Clone)]
 pub struct ActiveDownload {
     temp_path: PathBuf,
+    output_path: PathBuf,
     completion: watch::Receiver<Option<Result<(), String>>>,
     chunks: broadcast::Sender<DownloadChunk>,
     shutdown: watch::Receiver<bool>,
@@ -631,6 +764,10 @@ struct ClientAttachment {
 impl ActiveDownload {
     pub fn temp_path(&self) -> &Path {
         &self.temp_path
+    }
+
+    pub fn output_path(&self) -> &Path {
+        &self.output_path
     }
 
     pub fn completion(&self) -> watch::Receiver<Option<Result<(), String>>> {
@@ -920,7 +1057,7 @@ impl DownloadCoordinator {
             .try_acquire_owned()
             .map_err(|_| DownloadLimitError)?;
 
-        let temp_path = match temp_download_path(&output_path) {
+        let stream_path = match temp_stream_path(&output_path) {
             Ok(path) => path,
             Err(err) => {
                 let (completion_tx, completion) = watch::channel(Some(Err(err.to_string())));
@@ -928,7 +1065,8 @@ impl DownloadCoordinator {
                 let (chunks, _) = broadcast::channel(1);
                 let (cancel_tx, cancel_rx) = watch::channel(false);
                 return Ok(ActiveDownload {
-                    temp_path: output_path,
+                    temp_path: output_path.clone(),
+                    output_path,
                     completion,
                     chunks,
                     shutdown: cancel_rx,
@@ -950,7 +1088,7 @@ impl DownloadCoordinator {
             %key,
             %source_url,
             output_path = %output_path.display(),
-            temp_path = %temp_path.display(),
+            stream_path = %stream_path.display(),
             "starting new media download"
         );
         let (tx, rx) = watch::channel(None);
@@ -959,7 +1097,7 @@ impl DownloadCoordinator {
         let lifecycle = Arc::new(DownloadLifecycle {
             key: key.clone(),
             source_url: source_url.clone(),
-            temp_path: temp_path.clone(),
+            temp_path: stream_path.clone(),
             clients: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             completed: AtomicBool::new(false),
@@ -968,7 +1106,8 @@ impl DownloadCoordinator {
             cancel_tx: cancel_tx.clone(),
         });
         let active = ActiveDownload {
-            temp_path: temp_path.clone(),
+            temp_path: stream_path.clone(),
+            output_path: output_path.clone(),
             completion: rx.clone(),
             chunks: chunks.clone(),
             shutdown: cancel_rx.clone(),
@@ -1010,6 +1149,10 @@ impl DownloadCoordinator {
             }
             let _ = tx.send(Some(result));
             map.lock().await.remove(&key);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let _ = remove_stale_file(&stream_path).await;
+            });
         });
 
         Ok(active)
@@ -1023,6 +1166,7 @@ fn active_download_error(message: &str) -> ActiveDownload {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     ActiveDownload {
         temp_path: PathBuf::new(),
+        output_path: PathBuf::new(),
         completion,
         chunks,
         shutdown: cancel_rx,
@@ -1083,13 +1227,14 @@ pub fn stream_download(
     async_stream::try_stream! {
         let _client = active.attach_client();
         let mut offset = 0;
-        let path = active.temp_path().to_path_buf();
+        let temp_path = active.temp_path().to_path_buf();
+        let output_path = active.output_path().to_path_buf();
         let mut completion = active.completion();
         let mut chunks = active.subscribe();
         let mut shutdown = active.shutdown();
 
         loop {
-            if let Some(bytes) = read_available_bytes(&path, &mut offset).await? {
+            if let Some(bytes) = read_available_bytes(&temp_path, &mut offset).await? {
                 yield bytes;
                 continue;
             }
@@ -1121,10 +1266,11 @@ pub fn stream_download(
                 },
                 _ = wait_for_shutdown(&mut shutdown) => {
                     tracing::debug!(
-                        path = %path.display(),
+                        temp_path = %temp_path.display(),
+                        output_path = %output_path.display(),
                         "ending active media stream for shutdown"
                     );
-                    let _ = remove_stale_file(&path).await;
+                    let _ = remove_stale_file(&temp_path).await;
                     break;
                 },
                 _ = tokio::time::sleep(Duration::from_millis(150)) => {},
@@ -1317,8 +1463,9 @@ mod tests {
             mut shutdown: watch::Receiver<bool>,
         ) -> anyhow::Result<()> {
             self.downloads.fetch_add(1, Ordering::SeqCst);
+            let stream_path = temp_stream_path(output_path)?;
             let temp_path = temp_download_path(output_path)?;
-            fs::write(&temp_path, b"au").await?;
+            fs::write(&stream_path, b"au").await?;
             let _ = chunks.send(DownloadChunk {
                 offset: 0,
                 bytes: Bytes::from_static(b"au"),
@@ -1328,17 +1475,20 @@ mod tests {
                     _ = self.release.notified() => {},
                     _ = wait_for_shutdown(&mut shutdown) => {
                         remove_stale_file(&temp_path).await?;
+                        remove_stale_file(&stream_path).await?;
                         return Err(anyhow::anyhow!("mock download cancelled"));
                     },
                 }
             }
-            fs::write(&temp_path, b"audio").await?;
+            fs::write(&stream_path, b"audio").await?;
+            fs::write(&temp_path, b"cached-audio").await?;
             let _ = chunks.send(DownloadChunk {
                 offset: 2,
                 bytes: Bytes::from_static(b"dio"),
             });
             if self.fail {
                 remove_stale_file(&temp_path).await?;
+                remove_stale_file(&stream_path).await?;
                 return Err(anyhow::anyhow!("mock download failed"));
             }
             fs::rename(temp_path, output_path).await?;
@@ -1485,6 +1635,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_download_reads_live_stream_after_completion() {
+        let dir = tempdir().unwrap();
+        let output_path = dir.path().join("item.m4a");
+        let stream_path = temp_stream_path(&output_path).unwrap();
+        fs::write(&stream_path, b"audio").await.unwrap();
+
+        let (completion_tx, completion) = watch::channel(Some(Ok(())));
+        drop(completion_tx);
+        let (chunks, _) = broadcast::channel(1);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let active = ActiveDownload {
+            temp_path: stream_path,
+            output_path,
+            completion,
+            chunks,
+            shutdown: cancel_rx,
+            lifecycle: Arc::new(DownloadLifecycle {
+                key: "promoted".to_string(),
+                source_url: "url".to_string(),
+                temp_path: PathBuf::new(),
+                clients: AtomicUsize::new(0),
+                generation: AtomicU64::new(0),
+                completed: AtomicBool::new(true),
+                behavior: DisconnectBehavior::Cancel,
+                grace: Duration::from_secs(0),
+                cancel_tx,
+            }),
+        };
+
+        let mut stream = Box::pin(stream_download(active));
+
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"audio")
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn successful_download_promotes_temp_cache() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("item.m4a");
@@ -1497,8 +1686,7 @@ mod tests {
         release.notify_one();
         wait_done(active.completion()).await.unwrap();
 
-        assert_eq!(fs::read(&path).await.unwrap(), b"audio");
-        assert!(!active.temp_path().exists());
+        assert_eq!(fs::read(&path).await.unwrap(), b"cached-audio");
     }
 
     #[tokio::test]
@@ -1706,7 +1894,7 @@ mod tests {
         release.notify_one();
 
         wait_done(completion).await.unwrap();
-        assert_eq!(fs::read(&path).await.unwrap(), b"audio");
+        assert_eq!(fs::read(&path).await.unwrap(), b"cached-audio");
     }
 
     #[tokio::test]
@@ -1815,30 +2003,19 @@ mod tests {
     }
 
     #[test]
-    fn ytdlp_download_args_pin_m4a_output() {
-        let args = ytdlp_download_args(
-            Path::new("/usr/bin/ffmpeg"),
-            "-",
-            "https://soundcloud.com/example/item",
-            false,
-        );
+    fn ytdlp_download_args_select_best_audio_with_m4a_preference() {
+        let args = ytdlp_download_args("-", "https://soundcloud.com/example/item", false);
 
-        assert!(args.contains(&"bestaudio[ext=m4a]".to_string()));
+        assert!(args.contains(&"bestaudio[ext=m4a]/bestaudio/best".to_string()));
         assert!(args.contains(&"-".to_string()));
         assert!(args.contains(&"--no-part".to_string()));
         assert!(args_contains_pair(&args, "--playlist-items", "1"));
-        assert!(args.contains(&"--ffmpeg-location".to_string()));
         assert!(args.contains(&"--no-progress".to_string()));
     }
 
     #[test]
     fn ytdlp_download_args_limit_playlist_to_single_item() {
-        let args = ytdlp_download_args(
-            Path::new("/usr/bin/ffmpeg"),
-            "-",
-            "https://soundcloud.com/example/sets/album",
-            false,
-        );
+        let args = ytdlp_download_args("-", "https://soundcloud.com/example/sets/album", false);
 
         assert!(args_contains_pair(&args, "--playlist-items", "1"));
     }
@@ -1871,19 +2048,32 @@ mod tests {
 
     #[test]
     fn ytdlp_download_args_enable_debug_progress() {
-        let args = ytdlp_download_args(
-            Path::new("/usr/bin/ffmpeg"),
-            "-",
-            "https://soundcloud.com/example/item",
-            true,
-        );
+        let args = ytdlp_download_args("-", "https://soundcloud.com/example/item", true);
 
         assert!(args.contains(&"--progress".to_string()));
         assert!(args.contains(&"--newline".to_string()));
-        assert!(args.contains(&"--progress-delta".to_string()));
+        assert!(!args.contains(&"--progress-delta".to_string()));
         assert!(args
             .iter()
             .any(|arg| arg.starts_with("download:yt-dlp-rss-progress|")));
+    }
+
+    #[test]
+    fn ffmpeg_transcode_args_emit_faststart_aac_m4a_file() {
+        let args = ffmpeg_transcode_args(Path::new("/tmp/item.m4a"));
+
+        assert!(args_contains_pair(&args, "-i", "pipe:0"));
+        assert!(args_contains_pair(&args, "-c:a", "aac"));
+        assert!(args_contains_pair(
+            &args,
+            "-movflags",
+            "empty_moov+default_base_moof+frag_custom"
+        ));
+        assert!(args_contains_pair(&args, "-frag_duration", "1000000"));
+        assert!(args_contains_pair(&args, "-f", "mp4"));
+        assert!(args.contains(&"pipe:1".to_string()));
+        assert!(args_contains_pair(&args, "-movflags", "+faststart"));
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/item.m4a"));
     }
 
     #[test]

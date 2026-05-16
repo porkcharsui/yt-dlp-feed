@@ -1,4 +1,7 @@
 /target/
 /data/
 config.yaml
+.env
+docker/config.local.yaml
+docker/config.yaml
 .DS_Store

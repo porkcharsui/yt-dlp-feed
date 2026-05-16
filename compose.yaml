@@ -21,7 +21,7 @@ services:
   yt-dlp-feed:
     build:
       context: .
-    image: yt-dlp-feed:local
+    image: yt-dlp-feed:test
     network_mode: service:tailscale
     depends_on:
       - tailscale
@@ -29,8 +29,8 @@ services:
       RUST_LOG: ${RUST_LOG:-yt_dlp_feed=info,tower_http=info}
     volumes:
       - yt-dlp-feed-data:/data
-      - ./docker/config.yaml:/config/config.yaml:ro
-    command: ["--config", "/config/config.yaml"]
+      - ./config.yaml:/config/config.yaml:ro
+    command: ["--config", "/config/config.yaml", "--data-dir", "/data"]
     restart: unless-stopped
 
 volumes:
