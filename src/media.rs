@@ -1099,13 +1099,14 @@ impl DownloadCoordinator {
                 });
             }
         };
-        tracing::debug!(
+        tracing::info!(
             %key,
             %source_url,
             output_path = %output_path.display(),
             stream_path = %stream_path.display(),
-            "starting new media download"
+            "media download started"
         );
+        let job_started = Instant::now();
         let (tx, rx) = watch::channel(None);
         let (chunks, _) = broadcast::channel(64);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1152,14 +1153,16 @@ impl DownloadCoordinator {
                     %key,
                     %source_url,
                     output_path = %output_path.display(),
+                    elapsed_ms = job_started.elapsed().as_millis(),
                     "media download job completed"
                 ),
-                Err(err) => tracing::debug!(
+                Err(err) => tracing::info!(
                     %key,
                     %source_url,
                     output_path = %output_path.display(),
+                    elapsed_ms = job_started.elapsed().as_millis(),
                     error = %err,
-                    "media download job failed"
+                    "media download failed"
                 ),
             }
             let _ = tx.send(Some(result));
