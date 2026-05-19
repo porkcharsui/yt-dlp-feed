@@ -2,7 +2,7 @@ server:
   bind: "0.0.0.0:8080"
 
 cache:
-  data_dir: "./data"
+  data_dir: "/data"
   media_ttl_minutes: 360
   media_max_megabytes: 10240
   disconnect_behavior: "delay_cancel"
@@ -14,12 +14,12 @@ metadata:
 
 downloads:
   max_concurrent: 3
-  probe_timeout_seconds: 300
 
-# Docker enables this with YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED=true for the
-# pip-managed /opt/yt-dlp install. Leave disabled for local/dev runs.
+# Docker uses this for the pip-managed /opt/yt-dlp install. The image also sets
+# YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED=true so container runs stay enabled even
+# if a mounted config omits this section.
 pip_tool_updates:
-  enabled: false
+  enabled: true
   startup_check: true
   interval_hours: 168
   pip_package: "yt-dlp"
@@ -31,23 +31,14 @@ users:
   - name: "derek"
     services:
       - kind: "soundcloud"
-        name: "dereknet"
+        account: "dereknet"
         profile_url: "https://soundcloud.com/dereknet"
         feeds:
           - profile
           - likes
       - kind: "soundcloud"
-        name: "NTS"
+        account: "NTS"
         profile_url: "https://soundcloud.com/user-202286394-991268468"
         feeds:
           - profile
-      - kind: "soundcloud"
-        name: "Four Tet"
-        profile_url: "https://soundcloud.com/four-tet"
-        feeds:
-          - profile
-      - kind: "soundcloud"
-        name: "Caribou"
-        profile_url: "https://soundcloud.com/caribouband"
-        feeds:
-          - profile
+          - likes

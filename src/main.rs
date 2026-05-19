@@ -14,6 +14,7 @@ use yt_dlp_feed::auth::AuthLayer;
 use yt_dlp_feed::config::Config;
 use yt_dlp_feed::media::{DownloadCoordinator, YtDlpBackend};
 use yt_dlp_feed::metadata::MetadataCache;
+use yt_dlp_feed::pip_tool_update::{PipToolUpdateGate, PipToolUpdater};
 use yt_dlp_feed::state::AppState;
 
 #[derive(Debug, Parser)]
@@ -48,15 +49,19 @@ async fn main() -> anyhow::Result<()> {
     config.ensure_directories().await?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let update_gate = PipToolUpdateGate::new();
+    let updater = PipToolUpdater::new(config.pip_tool_updates.clone(), update_gate.clone());
+    updater.run_startup_check().await;
     let backend = YtDlpBackend::new(&config).await?;
     let metadata = Arc::new(MetadataCache::new(config.clone()).await?);
     let downloads = Arc::new(
-        DownloadCoordinator::from_arc_with_shutdown_disconnect_and_limit(
+        DownloadCoordinator::from_arc_with_shutdown_disconnect_limit_and_gate(
             Arc::new(backend),
             shutdown_rx,
             config.cache.disconnect_behavior,
             std::time::Duration::from_secs(config.cache.disconnect_grace_seconds),
             config.downloads.max_concurrent,
+            update_gate,
         ),
     );
     let state = AppState::new(
@@ -67,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     metadata.start_worker(Arc::clone(&downloads));
     metadata.start_startup_warming();
     metadata.start_scheduled_refresh();
+    updater.start_periodic();
     let app = build_router(state);
     let addr: SocketAddr = config.server.bind.parse().context("invalid server.bind")?;
     let listener = TcpListener::bind(addr).await?;

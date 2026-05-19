@@ -19,6 +19,7 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 
 use crate::config::{Config, DisconnectBehavior, SoundCloudFeedKind};
+use crate::pip_tool_update::{PipToolUpdateGate, PipToolUpdater};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FeedItem {
@@ -70,7 +71,7 @@ impl YtDlpBackend {
         fs::create_dir_all(&libs_dir).await?;
         fs::create_dir_all(&output_dir).await?;
 
-        let ytdlp_path = resolve_tool_path(libs_dir.join(executable_name("yt-dlp")), "yt-dlp")?;
+        let ytdlp_path = resolve_ytdlp_path(config)?;
         let ffmpeg_path = resolve_tool_path(libs_dir.join(executable_name("ffmpeg")), "ffmpeg")?;
         tracing::info!(
             yt_dlp = %ytdlp_path.display(),
@@ -115,6 +116,21 @@ fn resolve_tool_path(preferred_path: PathBuf, command_name: &str) -> anyhow::Res
             preferred_path.display()
         )
     })
+}
+
+fn resolve_ytdlp_path(config: &Config) -> anyhow::Result<PathBuf> {
+    if config.pip_tool_updates.enabled {
+        let ytdlp_path = PipToolUpdater::ytdlp_path();
+        if ytdlp_path.is_file() {
+            return Ok(ytdlp_path);
+        }
+        anyhow::bail!(
+            "pip_tool_updates.enabled=true requires {}",
+            ytdlp_path.display()
+        );
+    }
+
+    resolve_tool_path(config.libs_dir().join(executable_name("yt-dlp")), "yt-dlp")
 }
 
 fn find_in_path(command_name: &str) -> Option<PathBuf> {
@@ -742,6 +758,7 @@ pub struct DownloadCoordinator {
     backend: Arc<dyn MediaBackend>,
     in_flight: Arc<Mutex<HashMap<String, ActiveDownload>>>,
     download_slots: Arc<Semaphore>,
+    update_gate: PipToolUpdateGate,
     shutdown: watch::Receiver<bool>,
     disconnect_behavior: DisconnectBehavior,
     disconnect_grace: Duration,
@@ -914,6 +931,7 @@ impl DownloadCoordinator {
             backend: Arc::new(backend),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             download_slots: Arc::new(Semaphore::new(3)),
+            update_gate: PipToolUpdateGate::new(),
             shutdown: default_shutdown_receiver(),
             disconnect_behavior: DisconnectBehavior::DelayCancel,
             disconnect_grace: Duration::from_secs(15),
@@ -945,6 +963,7 @@ impl DownloadCoordinator {
             backend: Arc::new(backend),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             download_slots: Arc::new(Semaphore::new(3)),
+            update_gate: PipToolUpdateGate::new(),
             shutdown,
             disconnect_behavior,
             disconnect_grace,
@@ -956,6 +975,7 @@ impl DownloadCoordinator {
             backend,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             download_slots: Arc::new(Semaphore::new(3)),
+            update_gate: PipToolUpdateGate::new(),
             shutdown: default_shutdown_receiver(),
             disconnect_behavior: DisconnectBehavior::DelayCancel,
             disconnect_grace: Duration::from_secs(15),
@@ -1019,10 +1039,29 @@ impl DownloadCoordinator {
         disconnect_grace: Duration,
         max_concurrent: usize,
     ) -> Self {
+        Self::from_arc_with_shutdown_disconnect_limit_and_gate(
+            backend,
+            shutdown,
+            disconnect_behavior,
+            disconnect_grace,
+            max_concurrent,
+            PipToolUpdateGate::new(),
+        )
+    }
+
+    pub fn from_arc_with_shutdown_disconnect_limit_and_gate(
+        backend: Arc<dyn MediaBackend>,
+        shutdown: watch::Receiver<bool>,
+        disconnect_behavior: DisconnectBehavior,
+        disconnect_grace: Duration,
+        max_concurrent: usize,
+        update_gate: PipToolUpdateGate,
+    ) -> Self {
         Self {
             backend,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             download_slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            update_gate,
             shutdown,
             disconnect_behavior,
             disconnect_grace,
@@ -1035,6 +1074,7 @@ impl DownloadCoordinator {
         feed: SoundCloudFeedKind,
     ) -> anyhow::Result<Vec<FeedItem>> {
         tracing::debug!(%source_url, ?feed, "feed metadata request entering backend");
+        let _update_guard = self.update_gate.read_owned().await;
         self.backend.fetch_feed(source_url, feed).await
     }
 
@@ -1071,6 +1111,7 @@ impl DownloadCoordinator {
             .clone()
             .try_acquire_owned()
             .map_err(|_| DownloadLimitError)?;
+        let update_guard = self.update_gate.read_owned().await;
 
         let stream_path = match temp_stream_path(&output_path) {
             Ok(path) => path,
@@ -1143,6 +1184,7 @@ impl DownloadCoordinator {
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _update_guard = update_guard;
             let result = backend
                 .download_audio(&source_url, &output_path, chunks, cancel_rx)
                 .await
@@ -2006,6 +2048,19 @@ mod tests {
             resolve_tool_path(path.clone(), "missing-tool").unwrap(),
             path
         );
+    }
+
+    #[test]
+    fn enabled_pip_tool_updates_require_docker_venv_ytdlp() {
+        if PipToolUpdater::ytdlp_path().is_file() {
+            return;
+        }
+        let mut config = Config::default();
+        config.pip_tool_updates.enabled = true;
+
+        let err = resolve_ytdlp_path(&config).unwrap_err();
+
+        assert!(err.to_string().contains("/opt/yt-dlp/bin/yt-dlp"));
     }
 
     #[test]

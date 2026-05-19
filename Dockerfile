@@ -19,23 +19,25 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 
+ARG YT_DLP_PIP_CACHE_BUSTER=default
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         ffmpeg \
         libssl3 \
-        python3 \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv /opt/yt-dlp \
-    && /opt/yt-dlp/bin/pip install --no-cache-dir --upgrade pip yt-dlp \
-    && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp
+RUN echo "yt-dlp pip cache buster: ${YT_DLP_PIP_CACHE_BUSTER}" \
+    && python3 -m venv /opt/yt-dlp \
+    && /opt/yt-dlp/bin/python -m pip install --no-cache-dir --upgrade pip yt-dlp \
+    && test -x /opt/yt-dlp/bin/yt-dlp
 
 RUN useradd --create-home --home-dir /var/lib/yt-dlp-feed --shell /usr/sbin/nologin yt-dlp-feed \
     && mkdir -p /config /data \
-    && chown -R yt-dlp-feed:yt-dlp-feed /var/lib/yt-dlp-feed /data
+    && chown -R yt-dlp-feed:yt-dlp-feed /var/lib/yt-dlp-feed /data /opt/yt-dlp
 
 COPY --from=builder /app/target/release/yt-dlp-feed /usr/local/bin/yt-dlp-feed
 
@@ -43,6 +45,7 @@ USER yt-dlp-feed
 WORKDIR /var/lib/yt-dlp-feed
 
 ENV YT_DLP_FEED_CONFIG=/config/config.yaml
+ENV YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED=true
 
 EXPOSE 8080
 VOLUME ["/data"]

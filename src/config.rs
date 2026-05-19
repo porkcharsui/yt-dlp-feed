@@ -5,6 +5,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+const PIP_TOOL_UPDATES_ENABLED_ENV: &str = "YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
@@ -12,6 +14,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub metadata: MetadataConfig,
     pub downloads: DownloadsConfig,
+    pub pip_tool_updates: PipToolUpdatesConfig,
     pub auth: AuthConfig,
     pub users: Vec<UserConfig>,
 }
@@ -63,6 +66,15 @@ pub struct DownloadsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PipToolUpdatesConfig {
+    pub enabled: bool,
+    pub startup_check: bool,
+    pub interval_hours: Option<u64>,
+    pub pip_package: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserConfig {
     pub name: String,
     pub services: Vec<ServiceConfig>,
@@ -98,6 +110,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             metadata: MetadataConfig::default(),
             downloads: DownloadsConfig::default(),
+            pip_tool_updates: PipToolUpdatesConfig::default(),
             auth: AuthConfig::default(),
             users: vec![UserConfig {
                 name: "derek".to_string(),
@@ -197,12 +210,45 @@ impl DownloadsConfig {
     }
 }
 
+impl Default for PipToolUpdatesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            startup_check: true,
+            interval_hours: Some(168),
+            pip_package: "yt-dlp".to_string(),
+        }
+    }
+}
+
+impl PipToolUpdatesConfig {
+    pub fn interval(&self) -> Option<Duration> {
+        self.interval_hours
+            .map(|hours| Duration::from_secs(hours.saturating_mul(3600)))
+    }
+}
+
 impl Config {
     pub async fn load_or_default(path: &Path) -> anyhow::Result<Self> {
-        match fs::read_to_string(path).await {
+        let mut config = match fs::read_to_string(path).await {
             Ok(contents) => serde_yaml::from_str(&contents).context("invalid YAML config"),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+        }?;
+        config.apply_env_overrides();
+        Ok(config)
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Ok(value) = std::env::var(PIP_TOOL_UPDATES_ENABLED_ENV) {
+            match parse_bool(&value) {
+                Some(enabled) => self.pip_tool_updates.enabled = enabled,
+                None => tracing::warn!(
+                    env = PIP_TOOL_UPDATES_ENABLED_ENV,
+                    value,
+                    "ignoring invalid boolean environment value"
+                ),
+            }
         }
     }
 
@@ -261,6 +307,16 @@ impl Config {
         if self.metadata.refresh_interval_hours == Some(0) {
             tracing::warn!("metadata.refresh_interval_hours=0 is invalid; using default 24");
             self.metadata.refresh_interval_hours = MetadataConfig::default().refresh_interval_hours;
+        }
+
+        if self.pip_tool_updates.interval_hours == Some(0) {
+            tracing::warn!("pip_tool_updates.interval_hours=0 is invalid; using default 168");
+            self.pip_tool_updates.interval_hours = PipToolUpdatesConfig::default().interval_hours;
+        }
+
+        if self.pip_tool_updates.pip_package.trim().is_empty() {
+            tracing::warn!("pip_tool_updates.pip_package is empty; using default yt-dlp");
+            self.pip_tool_updates.pip_package = PipToolUpdatesConfig::default().pip_package;
         }
 
         if self.auth.enabled
@@ -366,9 +422,19 @@ impl Config {
             metadata_refresh_interval_hours = ?self.metadata.refresh_interval_hours,
             metadata_recent_grace_minutes = self.metadata.refresh_recent_grace_minutes,
             max_concurrent_downloads = self.downloads.max_concurrent,
+            pip_tool_updates_enabled = self.pip_tool_updates.enabled,
+            pip_tool_updates_interval_hours = ?self.pip_tool_updates.interval_hours,
             probe_timeout_seconds = self.downloads.probe_timeout_seconds,
             "yt-dlp-feed startup summary"
         );
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -441,6 +507,10 @@ mod tests {
         assert_eq!(config.cache.media_ttl(), Some(Duration::from_secs(21_600)));
         assert_eq!(config.cache.media_max_megabytes, Some(10_240));
         assert_eq!(config.cache.media_max_bytes(), Some(10_737_418_240));
+        assert!(!config.pip_tool_updates.enabled);
+        assert!(config.pip_tool_updates.startup_check);
+        assert_eq!(config.pip_tool_updates.interval_hours, Some(168));
+        assert_eq!(config.pip_tool_updates.pip_package, "yt-dlp");
         assert_eq!(config.downloads.max_concurrent, 3);
         assert_eq!(config.downloads.probe_timeout_seconds, 300);
         assert_eq!(config.downloads.probe_timeout(), Duration::from_secs(300));
@@ -480,6 +550,11 @@ auth:
   enabled: true
   username: "derek"
   password: "secret"
+pip_tool_updates:
+  enabled: true
+  startup_check: false
+  interval_hours: 24
+  pip_package: "yt-dlp-nightly"
 users:
   - name: "derek"
     services:
@@ -510,6 +585,14 @@ users:
         assert_eq!(config.downloads.probe_timeout(), Duration::from_secs(42));
         assert!(config.auth.enabled);
         assert_eq!(config.auth.username.as_deref(), Some("derek"));
+        assert!(config.pip_tool_updates.enabled);
+        assert!(!config.pip_tool_updates.startup_check);
+        assert_eq!(config.pip_tool_updates.interval_hours, Some(24));
+        assert_eq!(
+            config.pip_tool_updates.interval(),
+            Some(Duration::from_secs(86_400))
+        );
+        assert_eq!(config.pip_tool_updates.pip_package, "yt-dlp-nightly");
         assert!(config
             .service("derek", ServiceKind::Soundcloud, "dereknet")
             .is_some());
@@ -576,5 +659,13 @@ cache:
         assert_eq!(config.cache.media_ttl(), None);
         assert_eq!(config.cache.media_max_megabytes, Some(2048));
         assert_eq!(config.cache.media_max_bytes(), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn parses_bool_env_values() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("1"), Some(true));
+        assert_eq!(parse_bool("off"), Some(false));
+        assert_eq!(parse_bool("wat"), None);
     }
 }

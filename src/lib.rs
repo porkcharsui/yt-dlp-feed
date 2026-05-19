@@ -3,6 +3,7 @@ pub mod config;
 pub mod html;
 pub mod media;
 pub mod metadata;
+pub mod pip_tool_update;
 pub mod routes;
 pub mod rss_feed;
 pub mod state;

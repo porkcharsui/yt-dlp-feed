@@ -39,6 +39,22 @@ downloads:
   max_concurrent: 3
   probe_timeout_seconds: 300
 
+# Docker enables this with YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED=true for the
+# pip-managed /opt/yt-dlp install. Leave disabled for local/dev runs.
+pip_tool_updates:
+  enabled: false
+  startup_check: true
+  interval_hours: 168
+  pip_package: "yt-dlp"
+
+# Docker enables this with YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED=true for the
+# pip-managed /opt/yt-dlp install. Leave disabled for local/dev runs.
+pip_tool_updates:
+  enabled: false
+  startup_check: true
+  interval_hours: 168
+  pip_package: "yt-dlp"
+
 auth:
   enabled: false
 
@@ -190,12 +206,20 @@ docker build -t yt-dlp-feed .
 ```
 
 The image installs `yt-dlp` from PyPI at build time so it gets the current
-upstream extractor code instead of the older Debian package. To force Docker to
-fetch a fresh `yt-dlp` version, rebuild without cache:
+upstream extractor code instead of the older Debian package. Docker can cache
+that pip install layer, so normal rebuilds may keep the same build-time
+`yt-dlp` version. To refresh only the pip install layer without throwing away the
+whole build cache, pass a new `YT_DLP_PIP_CACHE_BUSTER` value:
 
 ```sh
-docker build --no-cache -t yt-dlp-feed .
+docker build \
+  --build-arg YT_DLP_PIP_CACHE_BUSTER="$(date +%Y-%m-%d)" \
+  -t yt-dlp-feed .
 ```
+
+Use a daily, weekly, or release-specific cache-buster value depending on how
+often you want build-time `yt-dlp` freshness. Runtime startup and weekly pip
+update checks still handle normal container freshness after the image is built.
 
 Run the container with the tracked example config, a persistent Docker volume for
 media and metadata, and debug logging enabled:
@@ -224,9 +248,21 @@ docker run --rm \
   yt-dlp-feed --config /config/config.yaml --data-dir /data --debug
 ```
 
-Plain `docker run -p 8080:8080` requires `server.bind: "0.0.0.0:8080"` in the
-mounted config. The Tailscale Compose setup should use `127.0.0.1:8080` so raw
-HTTP is only reachable inside the sidecar network namespace.
+The image includes pip-managed `yt-dlp` and `ffmpeg`. The local-run config binds
+`0.0.0.0:8080`; the Tailscale Compose config binds `127.0.0.1:8080` so raw HTTP
+is only reachable inside the sidecar network namespace. Both configs use `/data`
+for the media and metadata cache.
+
+In Docker, `yt-dlp` is installed from pip into the hardcoded virtualenv
+`/opt/yt-dlp`. The image build creates that virtualenv and fails if
+`/opt/yt-dlp/bin/yt-dlp` is not available. Docker sets
+`YT_DLP_FEED_PIP_TOOL_UPDATES_ENABLED=true`, which makes the server check for a
+newer pip package on startup and then weekly. The matching config
+section is named `pip_tool_updates` to make clear this is only for the
+Docker/pip-managed `yt-dlp` install, not a general app updater. Runtime update
+failures are logged and the existing `/opt/yt-dlp` install stays in use. While
+an update runs, new metadata refreshes and uncached audio downloads wait; cached
+media, index pages, and health checks remain available.
 
 ## Docker Compose With Tailscale
 
